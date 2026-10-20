@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.scdocx
+*.scdoc
+*.step
+*.stp
+*.iges
+*.igs
+#（注：内容由AI生成）

@@ -25,9 +25,9 @@ def connect(host: str | None = None, port: int = 50051):
         return Modeler(host=host, port=port)
 
     # 自动启动本地 Geometry 服务（本机为 Ansys 2024R1，显式指定 241）
-    from ansys.geometry.core.connection import launch_modeler
+    from ansys.geometry.core import launch_modeler_with_spaceclaim
 
-    return launch_modeler(product_version="241")
+    return launch_modeler_with_spaceclaim()
 
 
 def main():

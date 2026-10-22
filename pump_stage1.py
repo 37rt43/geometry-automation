@@ -109,6 +109,17 @@ def expected_volumes(p):
     }
 
 
+def check_connection(modeler):
+    """24.1 可返回 Version=0.0.0、Backend number=N/A，不能据此拒绝连接。"""
+    from ansys.geometry.core.connection.backend import BackendType
+
+    client = modeler.client
+    if not client.healthy:
+        raise RuntimeError("Geometry 服务连接不健康（Healthy=False）")
+    if client.backend_type != BackendType.SPACECLAIM:
+        raise RuntimeError(f"需要 SPACECLAIM 后端，实际为 {client.backend_type}")
+
+
 def build_pump(modeler, p):
     """只用基本草图、拉伸、差集与并集；工具体由布尔操作消耗。"""
     from ansys.geometry.core.math import Plane, Point2D, Point3D
@@ -194,10 +205,8 @@ def main():
 
     modeler = connect(args.host, args.port)
     try:
-        # 远程方式也明确验证后端为用户要求的 24.1。
-        version = modeler.client.backend_version
-        if (version.major, version.minor) != (24, 1):
-            raise RuntimeError(f"需要 2024R1（24.1）后端，实际为 {version}")
+        # 本机启动版本由 connect() 固定为 241；连接自检只看健康状态和类型。
+        check_connection(modeler)
         design = build_pump(modeler, p)
         check_bodies(design, p)
         destination = args.output.resolve()

@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from math import cos, hypot, isfinite, log, radians, sin, sqrt, tan
 import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from pump_meridional import Parameters as BlankParameters
 from pump_meridional import build_and_check as build_blank, connect
+from spaceclaim_diagnostics import run_checked_script
 
 
 @dataclass(frozen=True)
@@ -104,7 +104,7 @@ def native_script(p, blank):
     sections, angles = blade_sections(p, blank)
     return '''# Python Script, API Version = V241
 from System.Collections.Generic import List, ICollection
-from SpaceClaim.Api.V241.Modeler import Body as KernelBody
+stage = "read_blank"
 sections = %r
 angles = %r
 blade_count = %r
@@ -116,9 +116,13 @@ root = GetRootPart()
 if root.Bodies.Count != 1 or root.Bodies[0].Name != "ImpellerFluidBlank":
     raise Exception("Expected exactly one ImpellerFluidBlank")
 blank = root.Bodies[0]
+# Obtain the actual loaded API type; product 241 does not establish the CLR namespace.
+KernelBody = type(blank.Shape)
+api_context = str(blank.Shape.GetType().AssemblyQualifiedName)
 before = blank.Shape.Volume
 profiles = List[ICollection[ITrimmedCurve]]()
 planes = []
+stage = "create_31_profiles"
 for corners, theta in zip(sections, angles):
     import math
     curves = List[ITrimmedCurve]()
@@ -129,8 +133,10 @@ for corners, theta in zip(sections, angles):
     planes.append(Plane.Create(Frame.Create(points[0],
                   Direction.Create(-math.sin(theta), math.cos(theta), 0), Direction.DirZ)))
 # periodic=False, ruled=False: smooth loft, with identical corner correspondence.
+stage = "smooth_loft"
 first = KernelBody.LoftProfiles(profiles, False, False)
 if not first.IsClosed:
+    stage = "cap_and_stitch_loft"
     caps = List[KernelBody]()
     caps.Add(KernelBody.CreatePlanarBody(planes[0], profiles[0]))
     caps.Add(KernelBody.CreatePlanarBody(planes[-1], profiles[profiles.Count-1]))
@@ -138,6 +144,7 @@ if not first.IsClosed:
 if not first.IsClosed or first.PieceCount != 1 or first.Volume <= 0:
     raise Exception("Smooth loft did not produce one closed blade tool")
 # Protect the inlet eye even against small spline overshoot between sections.
+stage = "protect_inlet_eye"
 eye_plane = Plane.Create(Frame.Create(Point.Create(0, 0, MM(eye_z)), Direction.DirX, Direction.DirY))
 eye_curves = List[ITrimmedCurve]()
 eye_curves.Add(CurveSegment.Create(Circle.Create(eye_plane.Frame, MM(eye_radius))))
@@ -147,6 +154,7 @@ eye_tools.Add(eye)
 first.Subtract(eye_tools)
 tools = List[KernelBody]()
 tools.Add(first)
+stage = "copy_rotate_blades"
 for i in range(1, blade_count):
     copy = first.Copy()
     copy.Transform(Matrix.CreateRotation(Line.Create(Point.Origin, Direction.DirZ),
@@ -158,16 +166,19 @@ for tool in tools:
 # Check all pairs on transient copies, never consuming the actual tools.
 for i in range(blade_count):
     for j in range(i+1, blade_count):
+        stage = "blade_intersection_%%s_%%s" %% (i,j)
         probe = tools[i].Copy()
         others = List[KernelBody]()
         others.Add(tools[j].Copy())
         probe.Intersect(others)
         if probe.Faces.Count > 0 and probe.Volume > volume_tolerance:
             raise Exception("Blade tools intersect: %%s, %%s" %% (i,j))
+stage = "subtract_blades"
 blank.Shape.Subtract(tools)
 after = blank.Shape.Volume
 if not (0 < after < before-volume_tolerance):
     raise Exception("Boolean subtraction did not reduce fluid volume")
+stage = "check_connected_fluid"
 if not blank.Shape.IsClosed or blank.Shape.PieceCount != 1:
     raise Exception("Fluid must be one connected closed solid")
 blank.SetName("ImpellerFluid")
@@ -225,10 +236,7 @@ def build_impeller(modeler, p, blank):
     p.validate(blank)
     design = build_blank(modeler, blank)
     before = design.get_all_bodies()[0].volume.to("mm^3").magnitude
-    with TemporaryDirectory(prefix="pump_impeller_") as directory:
-        path = Path(directory)/"blades_v241.py"
-        path.write_text(native_script(p, blank), encoding="ascii")
-        values, design = modeler.run_script_file(path, import_design=True)
+    values, design = run_checked_script(modeler, native_script(p, blank), "impeller_blades")
     if (values.get("pieces") != "1" or values.get("closed") != "True"
             or values.get("pair_checks") != str(p.blade_count*(p.blade_count-1)//2)):
         raise RuntimeError(f"原生叶片/连通性检查未通过：{values}")

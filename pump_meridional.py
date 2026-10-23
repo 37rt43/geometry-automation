@@ -15,9 +15,9 @@ from dataclasses import dataclass, fields
 from math import cos, isclose, isfinite, pi, sin
 import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from main import connect
+from spaceclaim_diagnostics import run_checked_script
 
 
 @dataclass(frozen=True)
@@ -142,6 +142,7 @@ def spaceclaim_script(p):
     # 使用数值 repr 嵌入参数，避免依赖远程脚本参数字典或本机路径。
     return '''# Python Script, API Version = V241
 from System.Collections.Generic import List
+stage = "create_meridional_profile"
 vertices = %r
 hub_center = %r
 front_center = %r
@@ -169,12 +170,14 @@ if profile.Faces.Count != 1:
     raise Exception("Meridional profile must form one closed planar face")
 options = RevolveFaceOptions()
 options.ExtrudeType = ExtrudeType.Add
+stage = "revolve_meridional_profile"
 RevolveFaces.Execute(FaceSelection.Create(profile.Faces[0]),
                     Line.Create(Point.Origin, Direction.DirZ), DEG(360), options)
 if root.Bodies.Count != 1:
     raise Exception("Revolve must produce exactly one body, with no sheet/tool bodies")
 body = root.Bodies[0]
 body.SetName("ImpellerFluidBlank")
+stage = "check_closed_blank"
 if not body.Shape.IsClosed:
     raise Exception("Revolved body is not closed")
 result = {"closed": "True", "body_count": "1"}
@@ -188,10 +191,7 @@ def build_and_check(modeler, p):
         raise RuntimeError("需要 Healthy 的 SPACECLAIM 后端；不根据 Version=0.0.0 判错")
     modeler.create_design("impeller_blank")
     # 新建文档后运行原生旋转，再通过 PyAnsys 刷新并检查实体。
-    with TemporaryDirectory(prefix="pump_meridional_") as directory:
-        path = Path(directory) / "revolve_v241.py"
-        path.write_text(spaceclaim_script(p), encoding="ascii")
-        values, design = modeler.run_script_file(path, import_design=True)
+    values, design = run_checked_script(modeler, spaceclaim_script(p), "meridional_blank")
     if values.get("closed") != "True" or values.get("body_count") != "1":
         raise RuntimeError(f"原生封闭性检查未通过：{values}")
     bodies = design.get_all_bodies()

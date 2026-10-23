@@ -186,15 +186,21 @@ if not first.IsClosed or first.PieceCount != 1 or first.Volume <= 0:
     raise Exception("Single blade tool is not a connected closed solid")
 blade_volume = first.Volume
 stage = "subtract_single_blade"
-blank.Shape.Subtract(tools)
-after = blank.Shape.Volume
+# Both operands must be detached modeler bodies. A document-owned blank.Shape
+# cannot be mixed with the transient loft tool in the same Boolean operation.
+fluid = blank.Shape.Copy()
+fluid.Subtract(tools)
+after = fluid.Volume
 if not (0 < after < before-volume_tolerance):
     raise Exception("Boolean subtraction did not reduce fluid volume")
 stage = "check_connected_fluid"
-if not blank.Shape.IsClosed or blank.Shape.PieceCount != 1:
+if not fluid.IsClosed or fluid.PieceCount != 1:
     raise Exception("Fluid must be one connected closed solid")
-blank.SetName("ImpellerFluid")
-# Tools/caps/eye are transient kernel bodies, never added to the document.
+stage = "commit_single_blade_fluid"
+# Attach only after all raw-body operations and checks have finished.
+DesignBody.Create(root, "ImpellerFluid", fluid)
+blank.Delete()
+# Loft tools/caps/eye copies are transient; remove the document eye tool as well.
 tools.Clear()
 eye_tools.Clear()
 eye_body.Delete()

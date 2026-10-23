@@ -31,6 +31,25 @@ class InletLeadinTests(unittest.TestCase):
         self.assertEqual(len(tools_add), 1)
         self.assertEqual(tools_add[0].args[0].id, "first")
 
+    def test_subtraction_uses_detached_blank_before_attaching_result(self):
+        tree = ast.parse(native_script(Parameters(), BlankParameters()))
+        subtraction = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Attribute) and node.func.attr == "Subtract"]
+        # Both operations target detached shapes, not any DesignBody.Shape.
+        self.assertEqual({node.func.value.id for node in subtraction}, {"first", "fluid"})
+        copies = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "fluid" for t in node.targets)]
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(ast.unparse(copies[0].value), "blank.Shape.Copy()")
+        attach = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute)
+                  and isinstance(node.func.value, ast.Name) and node.func.value.id == "DesignBody"
+                  and node.func.attr == "Create"]
+        self.assertEqual(len(attach), 1)
+        self.assertEqual(attach[0].args[2].id, "fluid")
+        fluid_subtract = next(node for node in subtraction if node.func.value.id == "fluid")
+        self.assertLess(fluid_subtract.lineno, attach[0].lineno)
+
     def test_preserves_all_31_design_sections(self):
         p, blank = Parameters(), BlankParameters()
         design, angles = blade_sections(p, blank)

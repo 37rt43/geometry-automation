@@ -1,5 +1,16 @@
 # SpaceClaim 24.1 脚本诊断
 
+最新阶段重写了 `pump_meridional.py`，按指定 P/Q 控制点建立 R140 三次
+Bezier 无叶片毛坯。运行 `python pump_meridional.py` 导出新
+`impeller_blank.step`，并生成 `impeller_meridional.png`、
+`impeller_blank_isometric.png`、`impeller_blank_section.png`。
+`--preview-only` 仅生成同轮廓数据的参数预览，不生成 STEP。
+原生 `NurbsData` 使用阶数 4、端节点重数 4/4、单位权重控制点精确表达
+Bezier，并在后端与公式的 501 个采样值核对，误差上限 0.01 mm。
+旧 R50 单叶片脚本已增加尺寸兼容性提示，本次不自动适配或添加叶片。
+
+以下为先前单叶片调试的历史记录：
+
 当前阶段按用户要求仅从毛坯扣除一个空间叶片，不执行圆周阵列、校准或
 叶片间干涉检查。默认输出 `pump_impeller_single.step`，预览
 `pump_impeller_section.png` 也只显示一个叶片扣除区域。保留入口眼保护、

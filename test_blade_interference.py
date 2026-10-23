@@ -8,7 +8,7 @@ import numpy as np
 
 from blade_interference import overlap_from_losses
 from pump_impeller import Parameters, point_at
-from pump_meridional import Parameters as BlankParameters
+from test_legacy_blank_fixture import LegacyBlankParameters as BlankParameters
 
 
 class OverlapTests(unittest.TestCase):

@@ -38,6 +38,9 @@ class Parameters:
     volume_tolerance_mm3: float = 1e-3
 
     def validate(self, blank):
+        if getattr(blank, "profile_kind", "legacy_arcs") != "legacy_arcs":
+            raise ValueError("当前叶片参数基于旧 R50 圆弧毛坯，不能用于新 R140 Bezier 毛坯；"
+                             "本阶段请运行 pump_meridional.py，后续需重新设计匹配的叶片")
         blank.validate()
         if type(self.blade_count) is not int or self.blade_count != 1:
             raise ValueError("当前阶段仅支持一个叶片，尚不执行圆周阵列")

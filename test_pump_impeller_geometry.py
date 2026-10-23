@@ -6,10 +6,15 @@ from math import cos, hypot, sin
 import unittest
 
 from pump_impeller import Parameters, blade_sections, loft_sections, native_script
-from pump_meridional import Parameters as BlankParameters
+from test_legacy_blank_fixture import LegacyBlankParameters as BlankParameters
 
 
 class InletLeadinTests(unittest.TestCase):
+    def test_new_bezier_blank_requires_new_blade_design(self):
+        from pump_meridional import Parameters as NewBlankParameters
+        with self.assertRaisesRegex(ValueError, "R140"):
+            Parameters().validate(NewBlankParameters())
+
     def test_current_stage_is_single_blade_only(self):
         Parameters().validate(BlankParameters())
         with self.assertRaises(ValueError):

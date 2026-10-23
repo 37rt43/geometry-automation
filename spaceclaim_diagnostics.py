@@ -22,6 +22,8 @@ except Exception as error:
               "traceback": traceback.format_exc()}
     if "api_context" in globals():
         result["api_context"] = str(api_context)
+    if "pair_diagnostics" in globals():
+        result["pair_diagnostics"] = str(pair_diagnostics)
     try:
         result["dotnet_exception"] = error.clsException.ToString()
     except Exception:

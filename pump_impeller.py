@@ -12,6 +12,7 @@ python pump_impeller.py --preview-only
 
 import argparse
 from dataclasses import dataclass
+from inspect import getsource
 from math import cos, hypot, isfinite, log, radians, sin, sqrt, tan
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 from pump_meridional import Parameters as BlankParameters
 from pump_meridional import build_and_check as build_blank, connect
 from spaceclaim_diagnostics import run_checked_script
+from blade_interference import overlap_from_losses
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,7 @@ class Parameters:
     inlet_cap_clearance: float = 0.05  # 牺牲端面完全位于保护圆柱内的余量
     preview_z: float = 5.0
     volume_tolerance_mm3: float = 1e-3
+    rotation_tolerance_mm: float = 1e-4
 
     def validate(self, blank):
         blank.validate()
@@ -44,7 +47,7 @@ class Parameters:
             raise ValueError("section_count 必须为至少 3 的整数")
         values = (self.inlet_radius, self.outlet_radius, self.wrap_degrees,
                   self.tangential_thickness, self.axial_overcut, self.volume_tolerance_mm3,
-                  self.inlet_leadin, self.inlet_cap_clearance)
+                  self.inlet_leadin, self.inlet_cap_clearance, self.rotation_tolerance_mm)
         if any(not isfinite(v) or v <= 0 for v in values):
             raise ValueError("半径、包角、厚度、超切量和体积容差须为有限正数")
         if not isfinite(self.inlet_twist_degrees) or abs(self.inlet_twist_degrees) >= 45:
@@ -133,11 +136,14 @@ def native_script(p, blank):
     sections, angles = loft_sections(p, blank)
     return '''# Python Script, API Version = V241
 from System.Collections.Generic import List, ICollection
+%s
 stage = "read_blank"
 sections = %r
 angles = %r
 blade_count = %r
 eye_radius = %r
+eye_height = %r
+rotation_tolerance = %r
 volume_tolerance = %r * 1e-9
 root = GetRootPart()
 if root.Bodies.Count != 2:
@@ -183,24 +189,59 @@ first.Subtract(eye_tools)
 tools = List[KernelBody]()
 tools.Add(first)
 stage = "copy_rotate_blades"
+source_vertices = [vertex.Position for vertex in first.Vertices]
 for i in range(1, blade_count):
+    angle = i*360.0/blade_count
     copy = first.Copy()
     copy.Transform(Matrix.CreateRotation(Line.Create(Point.Origin, Direction.DirZ),
-                                        DEG(i*360.0/blade_count)))
+                                        DEG(angle)))
+    # Verify actual vertex placement rather than assuming Transform was applied.
+    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    expected_vertices = [(v.X*c-v.Y*s, v.X*s+v.Y*c, v.Z) for v in source_vertices]
+    actual_vertices = [vertex.Position for vertex in copy.Vertices]
+    if len(actual_vertices) != len(expected_vertices):
+        raise Exception("Rotated copy has an unexpected vertex count")
+    for x,y,z in expected_vertices:
+        if min((v.X-x)**2+(v.Y-y)**2+(v.Z-z)**2 for v in actual_vertices) > rotation_tolerance**2:
+            raise Exception("Blade rotation mismatch: index=%%s angle=%%s" %% (i,angle))
     tools.Add(copy)
 for tool in tools:
     if not tool.IsClosed or tool.PieceCount != 1 or tool.Volume <= 0:
         raise Exception("Blade tool is not a connected solid")
-# Check all pairs on transient copies, never consuming the actual tools.
+def remaining_volume(left, right):
+    target = left.Copy()
+    cutters = List[KernelBody]()
+    cutters.Add(right.Copy())
+    target.Subtract(cutters)
+    return target.Volume if target.Faces.Count > 0 else 0.0
+
+# Validate this kernel's difference semantics using cylinders, before trusting
+# pair checks. Avoid interpreting a non-empty receiver after an empty Intersect.
+stage = "calibrate_interference_check"
+reference = eye_body.Shape
+reference_volume = reference.Volume
+for shift, expected_fraction in ((2.0, 1.0), (0.5, 0.5)):
+    moved = reference.Copy()
+    moved.Transform(Matrix.CreateTranslation(Vector.Create(0, 0, MM(eye_height*shift))))
+    remaining = remaining_volume(reference, moved)
+    if abs(remaining-reference_volume*expected_fraction) > volume_tolerance:
+        raise Exception("Difference calibration failed: shift=%%s remaining=%%s" %% (shift,remaining))
+
+# Check all ten pairs on transient copies, never consuming the actual tools.
+pair_diagnostics = []
 for i in range(blade_count):
     for j in range(i+1, blade_count):
         stage = "blade_intersection_%%s_%%s" %% (i,j)
-        probe = tools[i].Copy()
-        others = List[KernelBody]()
-        others.Add(tools[j].Copy())
-        probe.Intersect(others)
-        if probe.Faces.Count > 0 and probe.Volume > volume_tolerance:
-            raise Exception("Blade tools intersect: %%s, %%s" %% (i,j))
+        va, vb = tools[i].Volume, tools[j].Volume
+        ra = remaining_volume(tools[i],tools[j])
+        rb = remaining_volume(tools[j],tools[i])
+        overlap = overlap_from_losses(va,vb,ra,rb,volume_tolerance)
+        pair_diagnostics.append({"pair": (i,j), "a_mm3": va*1e9, "b_mm3": vb*1e9,
+                                 "loss_a_mm3": (va-ra)*1e9, "loss_b_mm3": (vb-rb)*1e9,
+                                 "overlap_mm3": overlap*1e9})
+        if overlap > volume_tolerance:
+            raise Exception("Blade tools intersect: %%s, %%s; overlap=%%.9g mm3; A=%%.9g B=%%.9g mm3"
+                            %% (i,j,overlap*1e9,va*1e9,vb*1e9))
 stage = "subtract_blades"
 blank.Shape.Subtract(tools)
 after = blank.Shape.Volume
@@ -217,8 +258,11 @@ eye_body.Delete()
 if root.Bodies.Count != 1:
     raise Exception("Unexpected residual bodies")
 result = {"pieces": "1", "pair_checks": str(blade_count*(blade_count-1)//2),
+          "pair_diagnostics": str(pair_diagnostics),
           "closed": "True", "before_mm3": str(before*1e9), "after_mm3": str(after*1e9)}
-''' % (sections, angles, p.blade_count, p.inlet_radius, p.volume_tolerance_mm3)
+''' % (getsource(overlap_from_losses), sections, angles, p.blade_count, p.inlet_radius,
+       blank.inlet_z-blank.hub_outlet_z+10*p.axial_overcut,
+       p.rotation_tolerance_mm*1e-3, p.volume_tolerance_mm3)
 
 
 def save_preview(p, blank, destination):

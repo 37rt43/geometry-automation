@@ -109,13 +109,12 @@ sections = %r
 angles = %r
 blade_count = %r
 eye_radius = %r
-eye_z = %r
-eye_height = %r
 volume_tolerance = %r * 1e-9
 root = GetRootPart()
-if root.Bodies.Count != 1 or root.Bodies[0].Name != "ImpellerFluidBlank":
-    raise Exception("Expected exactly one ImpellerFluidBlank")
-blank = root.Bodies[0]
+if root.Bodies.Count != 2:
+    raise Exception("Expected blank and inlet-eye protection tool")
+blank = next(body for body in root.Bodies if body.Name == "ImpellerFluidBlank")
+eye_body = next(body for body in root.Bodies if body.Name == "InletEyeProtectionTool")
 # Obtain the actual loaded API type; product 241 does not establish the CLR namespace.
 KernelBody = type(blank.Shape)
 api_context = str(blank.Shape.GetType().AssemblyQualifiedName)
@@ -145,10 +144,9 @@ if not first.IsClosed or first.PieceCount != 1 or first.Volume <= 0:
     raise Exception("Smooth loft did not produce one closed blade tool")
 # Protect the inlet eye even against small spline overshoot between sections.
 stage = "protect_inlet_eye"
-eye_plane = Plane.Create(Frame.Create(Point.Create(0, 0, MM(eye_z)), Direction.DirX, Direction.DirY))
-eye_curves = List[ITrimmedCurve]()
-eye_curves.Add(CurveSegment.Create(Circle.Create(eye_plane.Frame, MM(eye_radius))))
-eye = KernelBody.ExtrudeProfile(eye_plane, eye_curves, MM(eye_height))
+# The eye cylinder is created by the 24.1 PyAnsys extrude_sketch API.
+# Avoid native ExtrudeProfile overloads, which differ across loaded API versions.
+eye = eye_body.Shape.Copy()
 eye_tools = List[KernelBody]()
 eye_tools.Add(eye)
 first.Subtract(eye_tools)
@@ -185,13 +183,12 @@ blank.SetName("ImpellerFluid")
 # Tools/caps/eye are transient kernel bodies, never added to the document.
 tools.Clear()
 eye_tools.Clear()
+eye_body.Delete()
 if root.Bodies.Count != 1:
     raise Exception("Unexpected residual bodies")
 result = {"pieces": "1", "pair_checks": str(blade_count*(blade_count-1)//2),
           "closed": "True", "before_mm3": str(before*1e9), "after_mm3": str(after*1e9)}
-''' % (sections, angles, p.blade_count, p.inlet_radius,
-       blank.hub_outlet_z-5*p.axial_overcut,
-       blank.inlet_z-blank.hub_outlet_z+10*p.axial_overcut, p.volume_tolerance_mm3)
+''' % (sections, angles, p.blade_count, p.inlet_radius, p.volume_tolerance_mm3)
 
 
 def save_preview(p, blank, destination):
@@ -232,10 +229,25 @@ def save_preview(p, blank, destination):
     plt.close(fig)
 
 
+def create_eye_tool(design, p, blank):
+    """通过 24.1 支持的圆草图拉伸创建入口眼保护工具，避开原生重载差异。"""
+    from ansys.geometry.core.math import Plane, Point2D, Point3D
+    from ansys.geometry.core.misc import UNITS
+    from ansys.geometry.core.sketch import Sketch
+
+    mm = UNITS.mm
+    z = blank.hub_outlet_z - 5*p.axial_overcut
+    height = blank.inlet_z - blank.hub_outlet_z + 10*p.axial_overcut
+    sketch = Sketch(Plane(origin=Point3D([0, 0, z], unit=mm)))
+    sketch.circle(Point2D([0, 0], unit=mm), p.inlet_radius*mm)
+    return design.extrude_sketch("InletEyeProtectionTool", sketch, distance=height*mm)
+
+
 def build_impeller(modeler, p, blank):
     p.validate(blank)
     design = build_blank(modeler, blank)
     before = design.get_all_bodies()[0].volume.to("mm^3").magnitude
+    create_eye_tool(design, p, blank)
     values, design = run_checked_script(modeler, native_script(p, blank), "impeller_blades")
     if (values.get("pieces") != "1" or values.get("closed") != "True"
             or values.get("pair_checks") != str(p.blade_count*(p.blade_count-1)//2)):

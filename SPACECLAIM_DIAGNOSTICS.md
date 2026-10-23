@@ -37,11 +37,14 @@ work/spaceclaim_diagnostics/<时间_唯一编号>/impeller_blades_response.json
 - PyAnsys 的 `revolve_sketch`、`create_body_from_loft_profile` 和 `rotate`
   标注最低要求 24R2，不能将它们用作本项目 24.1 的直接调用替代方案。
 - 原生 SpaceClaim 的 `Body.LoftProfiles`、`CreatePlanarBody`、`Fuse`、
-  `ExtrudeProfile`、`Copy`、`Transform`、布尔运算及 `PieceCount` 可在早于
+  `Copy`、`Transform`、布尔运算及 `PieceCount` 可在早于
   24.1 的原生 API 示例中找到；这与 PyAnsys 对相应 gRPC 接口的版本限制不同。
 - 已删除叶片脚本里未经本机确认的 `SpaceClaim.Api.V241.Modeler` 导入，改从
   当前毛坯的 `Shape` 取得实际加载的内核类型。产品版本和原生程序集命名
   不能直接等同。各重载在用户安装中的绑定仍须以实际运行结果确认。
+- 本机已确认原生 `ExtrudeProfile` 不接受原先的三个参数。入口眼保护圆柱
+  现改在本机 Python 中用 24.1 支持的 `Sketch.circle` + `extrude_sketch`
+  创建，不再调用该原生重载；原生叶片裁切使用其形状副本，完成后删除工具体。
 
 离线验证：
 

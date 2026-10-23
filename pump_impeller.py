@@ -1,18 +1,18 @@
-"""五个后弯空间叶片扣除后的叶轮流体域；长度 mm，角度 deg。
+"""当前阶段：仅扣除一个后弯空间叶片的叶轮流体域；长度 mm，角度 deg。
 
 python pump_impeller.py
 python pump_impeller.py --host HOST --port 50051
 python pump_impeller.py --preview-only
 
 复用 pump_meridional 的 connect/build_and_check，不建立其他泵腔。
-24.1 的放样、复制旋转和连通性检查通过 run_script_file 调用原生内核，
+不执行圆周阵列或叶片间干涉检查，先检查一个叶片的造型和扣除结果。
+24.1 的放样和连通性检查通过 run_script_file 调用原生内核，
 不使用要求 24R2 的 PyAnsys loft/rotate/get_collision 接口。
 预览是根据截面参数计算的 Z=5 mm 剖面示意，不冒充已运行的 CAD 截图。
 """
 
 import argparse
 from dataclasses import dataclass
-from inspect import getsource
 from math import cos, hypot, isfinite, log, radians, sin, sqrt, tan
 import os
 from pathlib import Path
@@ -20,12 +20,11 @@ from pathlib import Path
 from pump_meridional import Parameters as BlankParameters
 from pump_meridional import build_and_check as build_blank, connect
 from spaceclaim_diagnostics import run_checked_script
-from blade_interference import overlap_from_losses
 
 
 @dataclass(frozen=True)
 class Parameters:
-    blade_count: int = 5
+    blade_count: int = 1  # 当前阶段固定单叶片；后续再恢复圆周阵列
     inlet_radius: float = 27.5
     outlet_radius: float = 50.0
     wrap_degrees: float = 130.0
@@ -37,17 +36,16 @@ class Parameters:
     inlet_cap_clearance: float = 0.05  # 牺牲端面完全位于保护圆柱内的余量
     preview_z: float = 5.0
     volume_tolerance_mm3: float = 1e-3
-    rotation_tolerance_mm: float = 1e-4
 
     def validate(self, blank):
         blank.validate()
-        if not isinstance(self.blade_count, int) or self.blade_count < 2:
-            raise ValueError("blade_count 必须为至少 2 的整数")
+        if type(self.blade_count) is not int or self.blade_count != 1:
+            raise ValueError("当前阶段仅支持一个叶片，尚不执行圆周阵列")
         if not isinstance(self.section_count, int) or self.section_count < 3:
             raise ValueError("section_count 必须为至少 3 的整数")
         values = (self.inlet_radius, self.outlet_radius, self.wrap_degrees,
                   self.tangential_thickness, self.axial_overcut, self.volume_tolerance_mm3,
-                  self.inlet_leadin, self.inlet_cap_clearance, self.rotation_tolerance_mm)
+                  self.inlet_leadin, self.inlet_cap_clearance)
         if any(not isfinite(v) or v <= 0 for v in values):
             raise ValueError("半径、包角、厚度、超切量和体积容差须为有限正数")
         if not isfinite(self.inlet_twist_degrees) or abs(self.inlet_twist_degrees) >= 45:
@@ -136,14 +134,9 @@ def native_script(p, blank):
     sections, angles = loft_sections(p, blank)
     return '''# Python Script, API Version = V241
 from System.Collections.Generic import List, ICollection
-%s
 stage = "read_blank"
 sections = %r
 angles = %r
-blade_count = %r
-eye_radius = %r
-eye_height = %r
-rotation_tolerance = %r
 volume_tolerance = %r * 1e-9
 root = GetRootPart()
 if root.Bodies.Count != 2:
@@ -188,61 +181,11 @@ eye_tools.Add(eye)
 first.Subtract(eye_tools)
 tools = List[KernelBody]()
 tools.Add(first)
-stage = "copy_rotate_blades"
-source_vertices = [vertex.Position for vertex in first.Vertices]
-for i in range(1, blade_count):
-    angle = i*360.0/blade_count
-    copy = first.Copy()
-    copy.Transform(Matrix.CreateRotation(Line.Create(Point.Origin, Direction.DirZ),
-                                        DEG(angle)))
-    # Verify actual vertex placement rather than assuming Transform was applied.
-    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-    expected_vertices = [(v.X*c-v.Y*s, v.X*s+v.Y*c, v.Z) for v in source_vertices]
-    actual_vertices = [vertex.Position for vertex in copy.Vertices]
-    if len(actual_vertices) != len(expected_vertices):
-        raise Exception("Rotated copy has an unexpected vertex count")
-    for x,y,z in expected_vertices:
-        if min((v.X-x)**2+(v.Y-y)**2+(v.Z-z)**2 for v in actual_vertices) > rotation_tolerance**2:
-            raise Exception("Blade rotation mismatch: index=%%s angle=%%s" %% (i,angle))
-    tools.Add(copy)
-for tool in tools:
-    if not tool.IsClosed or tool.PieceCount != 1 or tool.Volume <= 0:
-        raise Exception("Blade tool is not a connected solid")
-def remaining_volume(left, right):
-    target = left.Copy()
-    cutters = List[KernelBody]()
-    cutters.Add(right.Copy())
-    target.Subtract(cutters)
-    return target.Volume if target.Faces.Count > 0 else 0.0
-
-# Validate this kernel's difference semantics using cylinders, before trusting
-# pair checks. Avoid interpreting a non-empty receiver after an empty Intersect.
-stage = "calibrate_interference_check"
-reference = eye_body.Shape
-reference_volume = reference.Volume
-for shift, expected_fraction in ((2.0, 1.0), (0.5, 0.5)):
-    moved = reference.Copy()
-    moved.Transform(Matrix.CreateTranslation(Vector.Create(0, 0, MM(eye_height*shift))))
-    remaining = remaining_volume(reference, moved)
-    if abs(remaining-reference_volume*expected_fraction) > volume_tolerance:
-        raise Exception("Difference calibration failed: shift=%%s remaining=%%s" %% (shift,remaining))
-
-# Check all ten pairs on transient copies, never consuming the actual tools.
-pair_diagnostics = []
-for i in range(blade_count):
-    for j in range(i+1, blade_count):
-        stage = "blade_intersection_%%s_%%s" %% (i,j)
-        va, vb = tools[i].Volume, tools[j].Volume
-        ra = remaining_volume(tools[i],tools[j])
-        rb = remaining_volume(tools[j],tools[i])
-        overlap = overlap_from_losses(va,vb,ra,rb,volume_tolerance)
-        pair_diagnostics.append({"pair": (i,j), "a_mm3": va*1e9, "b_mm3": vb*1e9,
-                                 "loss_a_mm3": (va-ra)*1e9, "loss_b_mm3": (vb-rb)*1e9,
-                                 "overlap_mm3": overlap*1e9})
-        if overlap > volume_tolerance:
-            raise Exception("Blade tools intersect: %%s, %%s; overlap=%%.9g mm3; A=%%.9g B=%%.9g mm3"
-                            %% (i,j,overlap*1e9,va*1e9,vb*1e9))
-stage = "subtract_blades"
+stage = "check_single_blade"
+if not first.IsClosed or first.PieceCount != 1 or first.Volume <= 0:
+    raise Exception("Single blade tool is not a connected closed solid")
+blade_volume = first.Volume
+stage = "subtract_single_blade"
 blank.Shape.Subtract(tools)
 after = blank.Shape.Volume
 if not (0 < after < before-volume_tolerance):
@@ -257,16 +200,13 @@ eye_tools.Clear()
 eye_body.Delete()
 if root.Bodies.Count != 1:
     raise Exception("Unexpected residual bodies")
-result = {"pieces": "1", "pair_checks": str(blade_count*(blade_count-1)//2),
-          "pair_diagnostics": str(pair_diagnostics),
+result = {"pieces": "1", "blade_count": "1", "blade_mm3": str(blade_volume*1e9),
           "closed": "True", "before_mm3": str(before*1e9), "after_mm3": str(after*1e9)}
-''' % (getsource(overlap_from_losses), sections, angles, p.blade_count, p.inlet_radius,
-       blank.inlet_z-blank.hub_outlet_z+10*p.axial_overcut,
-       p.rotation_tolerance_mm*1e-3, p.volume_tolerance_mm3)
+''' % (sections, angles, p.volume_tolerance_mm3)
 
 
 def save_preview(p, blank, destination):
-    """参数计算剖面：蓝色流体、白色叶片扣除区域，可见五条叶道及连通眼。"""
+    """参数计算剖面：蓝色流体、白色单叶片扣除区域及连通眼。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -294,7 +234,7 @@ def save_preview(p, blank, destination):
                             linestyle="--", edgecolor="#28707a", linewidth=1))
     ax.annotate("Connected inlet eye", (0, 22), ha="center", fontsize=10)
     ax.set(xlim=(-55,55), ylim=(-55,55), xlabel="X (mm)", ylabel="Y (mm)",
-           title=f"ImpellerFluid: Z={p.preview_z:g} mm section\nParameter-derived preview (not a CAD screenshot)")
+           title=f"ImpellerFluid: ONE blade cut, Z={p.preview_z:g} mm section\nParameter-derived preview (not a CAD screenshot)")
     ax.set_aspect("equal")
     ax.grid(alpha=0.15)
     fig.tight_layout()
@@ -324,15 +264,16 @@ def build_impeller(modeler, p, blank):
     create_eye_tool(design, p, blank)
     values, design = run_checked_script(modeler, native_script(p, blank), "impeller_blades")
     if (values.get("pieces") != "1" or values.get("closed") != "True"
-            or values.get("pair_checks") != str(p.blade_count*(p.blade_count-1)//2)):
-        raise RuntimeError(f"原生叶片/连通性检查未通过：{values}")
+            or values.get("blade_count") != "1"):
+        raise RuntimeError(f"原生单叶片/连通性检查未通过：{values}")
     bodies = design.get_all_bodies()
     if len(bodies) != 1 or bodies[0].is_surface or bodies[0].name != "ImpellerFluid":
         raise RuntimeError("最终必须只有一个 ImpellerFluid 实体，无残留工具体")
     after = bodies[0].volume.to("mm^3").magnitude
     if not isfinite(after) or not 0 < after < before-p.volume_tolerance_mm3:
         raise RuntimeError("布尔减后的流体体积未减小")
-    print(f"叶片两两检查通过；流体连通块=1；体积 {before:.6f} -> {after:.6f} mm³")
+    print(f"单叶片扣除完成；流体连通块=1；体积 {before:.6f} -> {after:.6f} mm³")
+    print(f"单叶片工具体积：{values.get('blade_mm3')} mm³")
     return design
 
 
@@ -341,7 +282,7 @@ def main():
     parser.add_argument("--host", default=os.getenv("ANSRV_GEO_HOST"))
     parser.add_argument("--port", type=int, default=int(os.getenv("ANSRV_GEO_PORT", "50051")))
     parser.add_argument("--output", type=Path,
-                        default=Path(__file__).resolve().with_name("pump_impeller.step"))
+                        default=Path(__file__).resolve().with_name("pump_impeller_single.step"))
     parser.add_argument("--preview", type=Path,
                         default=Path(__file__).resolve().with_name("pump_impeller_section.png"))
     parser.add_argument("--preview-only", action="store_true")

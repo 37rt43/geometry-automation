@@ -1,6 +1,7 @@
 """体积检查及参数几何的独立回归；不替代实际内核检查。"""
 
 from math import atan2, degrees
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -27,7 +28,8 @@ class OverlapTests(unittest.TestCase):
                 overlap_from_losses(*values)
 
     def test_nominal_twisted_sections_leave_clearance_at_72_degree_pitch(self):
-        p, blank = Parameters(), BlankParameters()
+        # 历史五叶片参数曲线检查；当前实际建模路径固定只切一个叶片。
+        p, blank = replace(Parameters(), blade_count=5), BlankParameters()
         minimum_clearance = 360.0/p.blade_count
         # 对各高度剖面的左右边界按真实圆柱半径对齐，独立于切向法平面距离。
         # 将曲线延拓到整个高度包络是保守检查（部分点在工具体外）。

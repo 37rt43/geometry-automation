@@ -1,14 +1,36 @@
 """入口相切布尔退化的离线几何回归；实际布尔仍须在 SpaceClaim 验证。"""
 
 from dataclasses import replace
+import ast
 from math import cos, hypot, sin
 import unittest
 
-from pump_impeller import Parameters, blade_sections, loft_sections
+from pump_impeller import Parameters, blade_sections, loft_sections, native_script
 from pump_meridional import Parameters as BlankParameters
 
 
 class InletLeadinTests(unittest.TestCase):
+    def test_current_stage_is_single_blade_only(self):
+        Parameters().validate(BlankParameters())
+        with self.assertRaises(ValueError):
+            replace(Parameters(), blade_count=5).validate(BlankParameters())
+
+    def test_native_single_blade_path_has_no_array_or_pair_check(self):
+        tree = ast.parse(native_script(Parameters(), BlankParameters()))
+        calls = [node.func.attr for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+        self.assertNotIn("Transform", calls)
+        self.assertNotIn("Intersect", calls)
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        self.assertNotIn("overlap_from_losses", names)
+        self.assertNotIn("pair_diagnostics", names)
+        # 唯一放入主减法工具集合的是 first（眼保护裁切使用另一集合）。
+        tools_add = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute) and node.func.attr == "Add"
+                     and isinstance(node.func.value, ast.Name) and node.func.value.id == "tools"]
+        self.assertEqual(len(tools_add), 1)
+        self.assertEqual(tools_add[0].args[0].id, "first")
+
     def test_preserves_all_31_design_sections(self):
         p, blank = Parameters(), BlankParameters()
         design, angles = blade_sections(p, blank)

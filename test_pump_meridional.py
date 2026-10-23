@@ -10,13 +10,24 @@ from scipy.integrate import quad
 from geomdl import BSpline
 
 from pump_meridional import (Parameters, bezier, boundary_z, check_profile,
-                             derivative, expected_volume, profile_data, spaceclaim_script)
+                             check_volume, derivative, expected_volume, profile_data, spaceclaim_script)
 from spaceclaim_diagnostics import instrument_script
 
 
 class MeridionalTests(unittest.TestCase):
     def setUp(self):
         self.p = Parameters()
+
+    def test_reported_24r1_volume_is_within_cad_tolerance(self):
+        report = check_volume(981353.3719923194,self.p)
+        self.assertAlmostEqual(report["difference_mm3"],12.47914743,places=5)
+        self.assertLess(report["relative_error"],self.p.volume_relative_tolerance)
+
+    def test_large_volume_errors_and_invalid_volumes_are_rejected(self):
+        target = expected_volume(self.p)
+        for actual in (target*1.001, target*.999, 0, -1, float("nan"), float("inf")):
+            with self.subTest(volume=actual),self.assertRaises(RuntimeError):
+                check_volume(actual,self.p)
 
     def test_specified_controls_and_endpoints(self):
         self.assertEqual(self.p.hub_controls, ((12,60),(12,15),(70,0),(140,0)))

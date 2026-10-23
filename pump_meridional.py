@@ -12,7 +12,7 @@ build_and_check(modeler, Parameters()) 可供后续与新尺寸匹配的叶片�
 
 import argparse
 from dataclasses import dataclass, fields
-from math import isclose, isfinite, pi
+from math import isfinite, pi
 import os
 from pathlib import Path
 
@@ -34,6 +34,8 @@ class Parameters:
     front_control1_z: float = 25.0
     front_control2_r: float = 90.0
     curve_tolerance_mm: float = 0.01
+    volume_relative_tolerance: float = 1e-4  # CAD 回转/体积计算允许 0.01% 偏差
+    volume_absolute_tolerance_mm3: float = 0.1
     preview_samples: int = 401
 
     @property
@@ -73,6 +75,9 @@ class Parameters:
                 and self.inlet_z > self.straight_end_z > self.front_outlet_z > self.hub_outlet_z
                 and 0 < self.curve_tolerance_mm <= 0.01):
             raise ValueError("进口半径、高度、正出口宽度或曲线误差限制不合法")
+        if not (0 < self.volume_relative_tolerance < 1
+                and self.volume_absolute_tolerance_mm3 > 0):
+            raise ValueError("体积相对容差须在 (0,1) 内，绝对容差须为正")
         for controls in (self.hub_controls, self.front_controls):
             if not (controls[0][0] == controls[1][0] < controls[2][0] < controls[3][0]
                     and controls[0][1] > controls[1][1] > controls[2][1] == controls[3][1]):
@@ -172,6 +177,22 @@ def expected_volume(p):
     if not isfinite(volume) or volume <= 0:
         raise ValueError("流体回转体积必须为正")
     return volume
+
+
+def check_volume(actual, p):
+    """解析积分为参考值，独立考虑 CAD 回转及体积计算的数值误差。"""
+    target = expected_volume(p)
+    allowed = max(p.volume_absolute_tolerance_mm3, target*p.volume_relative_tolerance)
+    if not isfinite(actual) or actual <= 0:
+        raise RuntimeError(f"CAD 返回的体积无效：{actual}")
+    difference = abs(actual-target)
+    relative = difference/target
+    if difference > allowed:
+        raise RuntimeError(f"CAD 体积 {actual:.9f} 与 Bezier 积分 {target:.9f} mm³ 不符；"
+                           f"差值 {difference:.9f} mm³（{relative:.6%}），"
+                           f"允许 {allowed:.9f} mm³")
+    return {"target_mm3": target, "difference_mm3": difference,
+            "relative_error": relative, "allowed_mm3": allowed}
 
 
 def save_preview(p, destination):
@@ -378,10 +399,12 @@ def build_and_check(modeler, p=None):
     if len(bodies) != 1 or bodies[0].name != "ImpellerFluidBlank" or bodies[0].is_surface:
         raise RuntimeError("应只有一个名为 ImpellerFluidBlank 的流体实体")
     actual = bodies[0].volume.to("mm^3").magnitude
-    target = expected_volume(p)
-    if not isfinite(actual) or not isclose(actual,target,rel_tol=1e-6,abs_tol=0.01):
-        raise RuntimeError(f"CAD 体积 {actual} 与精确 Bezier 回转积分 {target} mm³ 不符")
+    volume_check = check_volume(actual,p)
     print(f"曲线误差 {values['curve_error_mm']} mm；封闭单实体，体积 {actual:.6f} mm³")
+    print(f"Bezier 积分 {volume_check['target_mm3']:.6f} mm³；"
+          f"差值 {volume_check['difference_mm3']:.6f} mm³ "
+          f"({volume_check['relative_error']:.6%})；"
+          f"允许 {volume_check['allowed_mm3']:.6f} mm³")
     return design
 
 

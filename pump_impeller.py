@@ -31,6 +31,8 @@ class Parameters:
     inlet_twist_degrees: float = 8.0
     section_count: int = 31
     axial_overcut: float = 0.75
+    inlet_leadin: float = 1.0  # 入口牺牲延伸的最小长度，裁切后不保留
+    inlet_cap_clearance: float = 0.05  # 牺牲端面完全位于保护圆柱内的余量
     preview_z: float = 5.0
     volume_tolerance_mm3: float = 1e-3
 
@@ -41,7 +43,8 @@ class Parameters:
         if not isinstance(self.section_count, int) or self.section_count < 3:
             raise ValueError("section_count 必须为至少 3 的整数")
         values = (self.inlet_radius, self.outlet_radius, self.wrap_degrees,
-                  self.tangential_thickness, self.axial_overcut, self.volume_tolerance_mm3)
+                  self.tangential_thickness, self.axial_overcut, self.volume_tolerance_mm3,
+                  self.inlet_leadin, self.inlet_cap_clearance)
         if any(not isfinite(v) or v <= 0 for v in values):
             raise ValueError("半径、包角、厚度、超切量和体积容差须为有限正数")
         if not isfinite(self.inlet_twist_degrees) or abs(self.inlet_twist_degrees) >= 45:
@@ -100,8 +103,34 @@ def blade_sections(p, blank):
     return sections, angles
 
 
-def native_script(p, blank):
+def loft_sections(p, blank):
+    """31 个设计截面前加一个会被完全裁掉的牺牲端面，避免相切裁切。
+
+    设计入口平面 er·x=R 与保护圆柱 r=R 相切。直接相减可能形成零厚度边。
+    把首截面沿 -er 延伸，使整个牺牲四边形严格落在 r<R-clearance 内，
+    再用精确 R 圆柱裁回；不改变保护半径，也不对 BooleanException 静默跳过。
+    """
     sections, angles = blade_sections(p, blank)
+    theta = angles[0]
+    er = (cos(theta), sin(theta))
+    et = (-sin(theta), cos(theta))
+    max_tangent = max(abs(x*et[0]+y*et[1]) for x,y,z in sections[0])
+    safe_radius = p.inlet_radius-p.inlet_cap_clearance
+    if safe_radius <= max_tangent:
+        raise ValueError("入口扭曲/厚度过大，无法将牺牲端面置于保护圆柱内")
+    safe_projection = sqrt(safe_radius**2-max_tangent**2)
+    depth = max(p.inlet_leadin,
+                p.inlet_radius-safe_projection+p.inlet_cap_clearance)
+    if depth >= p.inlet_radius:
+        raise ValueError("入口牺牲延伸过长，会穿过旋转轴")
+    lead = [(x-depth*er[0], y-depth*er[1], z) for x,y,z in sections[0]]
+    if not all(hypot(x,y) < safe_radius for x,y,z in lead):
+        raise ValueError("入口牺牲端面未完全进入保护圆柱")
+    return [lead]+sections, [theta]+angles
+
+
+def native_script(p, blank):
+    sections, angles = loft_sections(p, blank)
     return '''# Python Script, API Version = V241
 from System.Collections.Generic import List, ICollection
 stage = "read_blank"
@@ -121,7 +150,7 @@ api_context = str(blank.Shape.GetType().AssemblyQualifiedName)
 before = blank.Shape.Volume
 profiles = List[ICollection[ITrimmedCurve]]()
 planes = []
-stage = "create_31_profiles"
+stage = "create_31_profiles_and_sacrificial_inlet"
 for corners, theta in zip(sections, angles):
     import math
     curves = List[ITrimmedCurve]()
@@ -142,7 +171,8 @@ if not first.IsClosed:
     first.Fuse(caps, False, None)
 if not first.IsClosed or first.PieceCount != 1 or first.Volume <= 0:
     raise Exception("Smooth loft did not produce one closed blade tool")
-# Protect the inlet eye even against small spline overshoot between sections.
+# The added inlet cap is strictly inside this cylinder: a volumetric cut,
+# not the former tangent R27.5 end-cap/cylinder subtraction.
 stage = "protect_inlet_eye"
 # The eye cylinder is created by the 24.1 PyAnsys extrude_sketch API.
 # Avoid native ExtrudeProfile overloads, which differ across loaded API versions.

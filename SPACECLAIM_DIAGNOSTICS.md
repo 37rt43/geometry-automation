@@ -45,6 +45,10 @@ work/spaceclaim_diagnostics/<时间_唯一编号>/impeller_blades_response.json
 - 本机已确认原生 `ExtrudeProfile` 不接受原先的三个参数。入口眼保护圆柱
   现改在本机 Python 中用 24.1 支持的 `Sketch.circle` + `extrude_sketch`
   创建，不再调用该原生重载；原生叶片裁切使用其形状副本，完成后删除工具体。
+- 入口眼布尔减曾在相切端面处报 non-manifold。现在保留原有 31 个设计截面，
+  额外增加一个完全落在 R27.5 保护圆柱内的牺牲入口截面，再按精确 R27.5
+  裁回。延伸量至少 1 mm，并根据扭曲/厚度自动加深，使端面具备 0.05 mm
+  内缩余量；这些参数集中于 `Parameters`。不缩小进口眼，也不忽略布尔异常。
 
 离线验证：
 

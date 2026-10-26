@@ -7,7 +7,7 @@ python pump_simple.py --output-dir output
 """
 
 PARAMS = {
-    "eye_diameter": 50.0,          # 进口眼/进口管共用的唯一流体直径
+    "eye_diameter": 30.0,          # 进口眼/进口管共用的唯一流体直径
     "inlet_length": 80.0,          # 进口流体圆柱长度，Z=-length..0，止于前盖板外表面
     "impeller_diameter": 120.0,    # 两平面盖板之间的流体圆盘外径
     "hub_diameter": 30.0,          # 叶片根部定位圆直径；此阶段不扣除轮毂实体
@@ -77,14 +77,15 @@ def validate(p):
     rs, rh, re, ro = (p[k]/2 for k in ("shaft_diameter", "hub_diameter", "eye_diameter", "impeller_diameter"))
     a, c = p["blade_thickness"]/2, p["probe_clearance"]
     beta = abs(radians(p["blade_installation_angle_deg"]))
-    if not rs < rh < re < ro:
-        raise ValueError("需满足 轴径 < 叶片根部定位圆直径 < 进口眼直径 < 叶轮外径")
-    if rh+a+c >= re or rh-a-c <= rs or a <= c:
-        raise ValueError("叶片根部须在轴孔外、进口眼内，并留足探针净空")
+    if not (rs < re < ro and rs < rh < ro):
+        raise ValueError("轴径须小于 eye 与叶片根部定位圆直径，二者均须小于叶轮外径")
+    # eye 可与根部定位圆同径；叶片从前盖板内表面开始，不会切坏眼部通道。
+    if rh+a+c >= ro or rh-a-c <= rs or a <= c:
+        raise ValueError("叶片根部须在轴孔外、叶轮外缘内，并留足探针净空")
     # 每个矩形刀具在自己的径向扇区内，扇区间留正间隙；保守限制避免刀具相交。
     if beta + asin((a+c)/rh) >= pi/p["blade_count"]:
         raise ValueError("安放角/厚度/叶片数导致叶片扇区交叠，请减小参数")
-    if c >= min(rs, p["blade_height"]/2, (rh-a-rs)/2, (ro-re)/2):
+    if c >= min(rs, p["blade_height"]/2, (rh-a-rs)/2, (ro-re)/2, (re-rs)/4):
         raise ValueError("probe_clearance 过大，无法放置内部验证点")
     if p["seal_chamber_diameter"] <= p["shaft_diameter"]:
         raise ValueError("预留密封腔径须大于轴径")
@@ -226,6 +227,61 @@ def check_channels(mesh, p):
             "connectivity": "continuous inner annulus joins all inter-blade passages; disjoint blade sectors"}
 
 
+def save_png_safely(fig, destination):
+    """先在内存渲染，再同目录临时写入并原子替换；路径/占用/渲染错误只记警告。"""
+    from io import BytesIO
+    from pathlib import PureWindowsPath
+    import matplotlib.pyplot as plt
+    destination = Path(destination)
+    temporary = None
+    try:
+        if any(ord(ch) < 32 for ch in str(destination)) or destination.suffix.lower() != ".png":
+            raise ValueError("PNG 路径含控制字符或扩展名错误")
+        if os.name == "nt":
+            windows_path = PureWindowsPath(destination)
+            for part in windows_path.parts:
+                if part == windows_path.anchor:
+                    continue
+                if (any(ch in '<>:"|?*' for ch in part) or part.endswith((" ", "."))
+                        or PureWindowsPath(part).is_reserved()):
+                    raise ValueError("Windows 路径组件不合法："+part)
+        destination = destination.resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        buffer = BytesIO()
+        fig.savefig(buffer, format="png", dpi=180)
+        # 不直接向目标 PNG 写入；查看器锁定目标时替换会给出明确的 OSError。
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix="pump_png_", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(buffer.getvalue())
+        os.replace(temporary, destination)
+        return {"saved": True, "path": str(destination)}
+    except Exception as error:
+        warning = {"saved": False, "path": str(destination), "error": str(error),
+                   "errno": getattr(error, "errno", None),
+                   "hint": "请检查路径、写权限和图片查看器占用；已有同名图片可能为旧版本。"}
+        print("PNG 保存警告（不影响 STEP/几何检查）："+json.dumps(warning, ensure_ascii=False))
+        return warning
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        plt.close(fig)
+
+
+def optional_plot(function, *args, **kwargs):
+    """绘图/截线文件 IO 是可选输出，不混入几何验收的成功或失败判定。"""
+    try:
+        return function(*args, **kwargs)
+    except Exception as error:
+        import matplotlib.pyplot as plt
+        plt.close("all")
+        warning = {"saved": False, "error": str(error), "function": function.__name__}
+        print("可选图像输出警告："+json.dumps(warning, ensure_ascii=False))
+        return warning
+
+
 def save_sections(mesh, p, output, name="impeller"):
     """使用 PyVista 截面工具处理 CAD 三角化表面，同时输出轴中心剖面和中高截面。"""
     import numpy as np
@@ -266,9 +322,9 @@ def save_sections(mesh, p, output, name="impeller"):
         ax.set_ylabel("Z (mm)" if vertical else "Y (mm)")
         ax.set_title(name+": "+("CAD axial section through Z axis" if vertical else "CAD transverse section"))
     fig.suptitle("CFD domain: blue = fluid, white = excluded material")
-    fig.savefig(output/(name+"_sections.png"), dpi=180)
-    plt.close(fig)
-    return {"source": "CAD tessellation / PyVista slice", "axial_cells": axial.n_cells, "mid_cells": mid.n_cells}
+    png = save_png_safely(fig, output/(name+"_sections.png"))
+    return {"source": "CAD tessellation / PyVista slice", "axial_cells": axial.n_cells, "mid_cells": mid.n_cells,
+            "png": png}
 
 
 def fit_cylinder_section(mesh, radius_range, label, p, z_range=None):
@@ -468,8 +524,7 @@ def save_alignment_section(meshes, p, output):
     ax.set(xlabel="X (mm)", ylabel="Y (mm)", title="Actual mid-height fluid / blade and shaft voids")
     ax.set_aspect("equal"); ax.legend()
     fig.suptitle("CFD assembly: actual sections, no mirroring or filling of blade voids")
-    fig.savefig(output/"pump_alignment_section.png", dpi=180)
-    plt.close(fig)
+    return save_png_safely(fig, output/"pump_alignment_section.png")
 
 
 def export_parts(modeler, design, p, output):
@@ -545,11 +600,11 @@ def main():
                     checks["channels"] = check_channels(mesh, p)
                     checks["footprint"] = check_impeller_footprint(mesh, p)
                     checks["shrouds"] = check_shrouds(mesh, p)
-                checks["sections"] = save_sections(mesh, p, output, name)
+                checks["sections"] = optional_plot(save_sections, mesh, p, output, name)
                 report["parts"][name] = checks
                 print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")
             report["interface"] = check_alignment(meshes, p)
-            save_alignment_section(meshes, p, output)
+            report["alignment_plot"] = optional_plot(save_alignment_section, meshes, p, output)
             report["status"] = "exported_checks_passed"
         except Exception as error:
             report["status"] = "exported_checks_failed"
@@ -558,7 +613,7 @@ def main():
             raise
         finally:
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("STEP 导出及检查完成；请查看 inlet_sections.png、impeller_sections.png 和 pump_alignment_section.png。")
+        print("STEP 导出及几何检查完成；图片保存状态见 pump_simple_checks.json。")
     finally:
         modeler.close()
 

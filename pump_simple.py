@@ -241,8 +241,8 @@ def check_channels(mesh, p):
         angle = 2*pi*i/(p["blade_count"]*4)
         radius = (rs+p["hub_diameter"]/2)/2
         points.append([radius*cos(angle),radius*sin(angle),zmid]); expected.append(True)
-    require_probes(mesh,points,expected,"扇区叶片/叶间通道检查")
-    return {"passed":True,"probe_count":len(points),"blade_width_definition":"outer arc length"}
+    probes = require_probes(mesh,points,expected,"扇区叶片/叶间通道检查")
+    return {"passed":probes["passed"],"probes":probes,"probe_count":len(points),"blade_width_definition":"outer arc length"}
 
 
 def save_png_safely(fig, destination):
@@ -382,15 +382,62 @@ def fit_cylinder_section(mesh, radius_range, label, p, z_range=None):
 
 
 def require_probes(mesh, points, expected, label):
+    """诊断探针：失败只返回完整详情并警告，不改变几何，也不抛出异常。"""
     import numpy as np
-    points = np.asarray(points, dtype=float).reshape(-1, 3)
-    expected = np.asarray(expected, dtype=bool)
-    actual = mesh_inside(mesh, points)
-    failed = np.flatnonzero(actual != expected)
-    if failed.size:
-        details = [{"xyz_mm": points[i].tolist(), "expected_fluid": bool(expected[i]),
-                    "actual_fluid": bool(actual[i])} for i in failed[:8]]
-        raise RuntimeError(f"{label}: {failed.size}/{len(points)} 个探针失败；"+json.dumps(details))
+    result = {"kind": "probe_check", "label": label, "passed": False, "failures": []}
+    try:
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        expected = np.asarray(expected, dtype=bool)
+        actual = mesh_inside(mesh, points)
+        failed = np.flatnonzero(actual != expected)
+        result.update(probe_count=len(points), failed_count=int(failed.size), passed=not bool(failed.size))
+        result["failures"] = [{"index": int(i), "xyz_mm": points[i].tolist(),
+                               "expected_fluid": bool(expected[i]), "actual_fluid": bool(actual[i])}
+                              for i in failed]
+    except Exception as error:
+        result["error"] = str(error)
+    if not result["passed"]:
+        print(f"探针警告（非致命）：{label}；失败数 {result.get('failed_count', '未完成分类')}，详情写入检查报告。")
+    return result
+
+
+def run_probe_check(function, *args):
+    """仅隔离探针检查阶段的分类/采样异常；几何和导出异常保持原处理。"""
+    try:
+        return function(*args)
+    except Exception as error:
+        warning = {"kind": "probe_check", "label": function.__name__, "passed": False,
+                   "failures": [], "error": str(error)}
+        print("探针警告（非致命）："+function.__name__+"："+str(error))
+        return warning
+
+
+def collect_probe_warnings(value, path=""):
+    warnings = []
+    if isinstance(value, dict):
+        if value.get("kind") == "probe_check" and not value.get("passed", False):
+            warnings.append({"path": path, **value})
+        else:
+            for key, item in value.items():
+                warnings.extend(collect_probe_warnings(item, path+"/"+str(key)))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            warnings.extend(collect_probe_warnings(item, path+"/"+str(index)))
+    return warnings
+
+
+def sector_fluid_expected(x, y, p):
+    """主流道解析掩码：圆盘减轴孔及 n 个实际环形扇区；叶片位置始终为 False。"""
+    import numpy as np
+    radius = np.hypot(x, y)
+    expected = (radius > p["shaft_diameter"]/2) & (radius < p["impeller_diameter"]/2)
+    angle = np.arctan2(y, x)
+    for theta, half, rh, ro in blade_layout(p):
+        delta = np.arctan2(np.sin(angle-theta), np.cos(angle-theta))
+        epsilon = 32*np.finfo(float).eps
+        blade = (radius >= rh-epsilon*ro) & (radius <= ro+epsilon*ro) & (np.abs(delta) <= half+epsilon)
+        expected &= ~blade
+    return expected
 
 
 def check_alignment(meshes, p):
@@ -431,7 +478,7 @@ def check_alignment(meshes, p):
             angle = 2*pi*(i+0.5)/(p["blade_count"]*4)
             for radius, fluid in ((rs/2, False), (ring_middle, True), (re+(re-rs)/2, False)):
                 points.append([radius*cos(angle), radius*sin(angle), z]); expected.append(fluid)
-    require_probes(meshes["inlet"], points, expected, "进口环形流体/轴孔检查")
+    probe_results = [require_probes(meshes["inlet"], points, expected, "进口环形流体/轴孔检查")]
     # 采样位置由半径与角度在全局 XY 中直接构造，两个域用完全相同的 XY。
     xy = []
     for i in range(p["blade_count"]):
@@ -441,9 +488,9 @@ def check_alignment(meshes, p):
     dz = min(p["front_shroud_thickness"]/2, length/4)  # 离开接口三角面，不在 Z=±0.3 的近边界层采样
     for name, z in (("inlet", -dz), ("impeller", dz)):
         probes = [[x, y, z] for x, y in xy]
-        require_probes(meshes[name], probes, [True]*len(probes), name+" 接口通流检查")
-        require_probes(meshes[name], [[0, 0, z]], [False], name+" 贯通轴孔检查")
-    return {"passed": True, "inlet_probe_count": len(points), "throughflow_paths": len(xy),
+        probe_results.append(require_probes(meshes[name], probes, [True]*len(probes), name+" 接口通流检查"))
+        probe_results.append(require_probes(meshes[name], [[0, 0, z]], [False], name+" 贯通轴孔检查"))
+    return {"passed": all(item["passed"] for item in probe_results), "probe_results": probe_results, "inlet_probe_count": len(points), "throughflow_paths": len(xy),
             "cylinder_fits": fits, "alignment_tolerance_mm": tol,
             "interface_z_mm": 0, "axial_gap_mm": float(meshes["impeller"].bounds[4]-meshes["inlet"].bounds[5]),
             "diameter_parameters": ["eye_diameter", "shaft_diameter"],
@@ -485,12 +532,10 @@ def check_impeller_footprint(mesh, p):
     xx, yy = np.meshgrid(u, u)
     x, y = xx.ravel(), yy.ravel()
     radius = np.hypot(x, y)
-    expected = (radius < r) & (radius > rs)
+    expected = sector_fluid_expected(x, y, p)
     margin = np.minimum(np.abs(radius-r), np.abs(radius-rs))
     for theta, half, rh, ro in blade_layout(p):
         delta = np.arctan2(np.sin(np.arctan2(y,x)-theta),np.cos(np.arctan2(y,x)-theta))
-        slot = (radius >= rh) & (radius <= ro) & (np.abs(delta) <= half)
-        expected &= ~slot
         # 保守排除圆弧和两条角边附近的点，避免三角化近似引起误判。
         margin = np.minimum(margin, np.abs(radius-rh))
         margin = np.minimum(margin, radius*np.abs(np.sin(np.abs(delta)-half)))
@@ -499,9 +544,12 @@ def check_impeller_footprint(mesh, p):
     _, closest = mesh.find_closest_cell(points, return_closest_point=True)
     safe = (margin > p["probe_clearance"]) & (np.linalg.norm(points-closest, axis=1) > p["probe_clearance"])
     if not safe.any():
-        raise RuntimeError("叶轮平面网格不足以检查圆盘包络和叶片槽")
-    require_probes(mesh, points[safe], expected[safe], "叶轮完整圆盘/轴孔/阵列槽平面检查")
-    return {"passed": True, "probe_count": int(safe.sum()), "blade_count": p["blade_count"],
+        warning = {"kind": "probe_check", "label": "check_impeller_footprint", "passed": False,
+                   "probe_count": 0, "failures": [], "error": "无远离边界的可用探针，跳过平面抽查"}
+        print("探针警告（非致命）："+warning["error"])
+        return warning
+    probes = require_probes(mesh, points[safe], expected[safe], "叶轮完整圆盘/轴孔/阵列槽平面检查")
+    return {"passed": probes["passed"], "probes": probes, "probe_count": int(safe.sum()), "blade_count": p["blade_count"],
             "definition": "full circular disk minus shaft and equally spaced annular sector slots"}
 
 
@@ -517,8 +565,8 @@ def check_shrouds(mesh, p):
             points.append([radius*cos(angle), radius*sin(angle), tf/2]); expected.append(fluid)
         # 后盖板原体积中没有流体。
         points.append([(rs+r)/2*cos(angle), (rs+r)/2*sin(angle), tf+h+tb/2]); expected.append(False)
-    require_probes(mesh, points, expected, "前后盖板/进口眼壁面检查")
-    return {"passed": True, "probe_count": len(points), "front_eye_z_mm": [0, tf],
+    probes = require_probes(mesh, points, expected, "前后盖板/进口眼壁面检查")
+    return {"passed": probes["passed"], "probes": probes, "probe_count": len(points), "front_eye_z_mm": [0, tf],
             "blade_channel_z_mm": [tf, tf+h], "rear_shroud_z_mm": [tf+h, tf+h+tb]}
 
 
@@ -679,9 +727,9 @@ def main():
                 mesh, checks = check_part(body, name, p)
                 meshes[name] = mesh
                 if name == "impeller":
-                    checks["channels"] = check_channels(mesh, p)
-                    checks["footprint"] = check_impeller_footprint(mesh, p)
-                    checks["shrouds"] = check_shrouds(mesh, p)
+                    checks["channels"] = run_probe_check(check_channels, mesh, p)
+                    checks["footprint"] = run_probe_check(check_impeller_footprint, mesh, p)
+                    checks["shrouds"] = run_probe_check(check_shrouds, mesh, p)
                     checks["outer_rim"] = check_outer_rim(mesh, p)
                     checks["outer_rim_plot"] = optional_plot(save_outer_rim_section, mesh, p, output)
                 checks["sections"] = optional_plot(save_sections, mesh, p, output, name)
@@ -690,7 +738,10 @@ def main():
             report["interface"] = check_alignment(meshes, p)
             report["interface"]["cap_match"] = check_interface_caps(meshes, p)
             report["alignment_plot"] = optional_plot(save_alignment_section, meshes, p, output)
-            report["status"] = "exported_checks_passed"
+            report["probe_warnings"] = collect_probe_warnings(report)
+            report["status"] = "exported_with_probe_warnings" if report["probe_warnings"] else "exported_checks_passed"
+            if report["probe_warnings"]:
+                print(f"三个 STEP 导出成功；{len(report['probe_warnings'])} 项探针警告已记录，正常结束（退出码 0）。")
         except Exception as error:
             report["status"] = "exported_checks_failed"
             report["error"] = str(error)
@@ -698,7 +749,7 @@ def main():
             raise
         finally:
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("STEP 导出及几何检查完成；图片保存状态见 pump_simple_checks.json。")
+        print("STEP 主流程完成；检查和警告详情见 pump_simple_checks.json。")
     finally:
         modeler.close()
 

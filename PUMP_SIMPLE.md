@@ -105,7 +105,7 @@ PyAnsys 公共 `split_body` 需要 2025R2，仓库指定的 2024R1 不能调用�
 属于真实叶片空区，不应通过镜像补图或填平槽修饰。改叶片数/角度后应参考横截面理解轴剖面。
 图只显示真实流体，不把被减去的金属涂成流体。
 
-后续检查失败时保留已导出的三份 STEP，报告 `status=exported_checks_failed` 和异常，非零退出；
+结构性几何检查失败时保留已导出的三份 STEP，报告 `status=exported_checks_failed` 和异常，非零退出；
 检查全通过标记 `exported_checks_passed`。导出不等于验收通过，未做 STEP 重新导入校验。
 
 ## 此次云端验证的范围
@@ -191,3 +191,27 @@ PNG 仍为可选输出，失败记录警告，不影响 STEP。
 核对解析体积、连通性、接口、eye/轴孔、叶片探针和外圆拟合。
 网格测试替身为消除离散圆弦交错允许极小数值裕量；生产草图使用精确同半径圆弧，未径向超切。
 真实 CAD 外缘及三份 STEP 导出仍需在 Windows SpaceClaim 24.1 本机验收。
+
+## 探针为非致命诊断
+
+几何、整体分区、三个 STEP 的导出函数及尺寸未改变。
+`require_probes()` 不再抛出探针不匹配异常，改为打印警告并返回全部失败记录：
+点索引、`xyz_mm`、`expected_fluid`、`actual_fluid`，不再只保留前 8 点。
+叶片通道、平面 footprint、盖板探针均返回真实 `passed` 状态和嵌套 `probes`，
+对齐检查中的探针结果保存在 `interface.probe_results`，不伪造为全部通过。
+分类/采样异常及无可用 footprint 点也只记录非致命警告。
+
+主报告汇总到 `probe_warnings`，每项含原始结果路径和失败详情。
+有探针警告时 `status=exported_with_probe_warnings`，CLI 正常返回成功（退出码 0）；
+无探针警告时仍为 `exported_checks_passed`。探针误报不会再产生未捕获异常或 CRITICAL。
+真实服务连接、布尔建模、文件导出、体积/封闭性/接口尺寸等结构检查错误仍保留原处理，
+并未把这些错误改成成功。PNG 的独立容错仍保留。
+
+`sector_fluid_expected()` 统一按主通道半径、阵列节距、安放角和
+`blade_thickness/外半径` 角宽解析判断扇区：轴孔及每个实际叶片扇区为 false，
+其余圆盘内为 true；角度使用周期差，边界仅加浮点舍入量。
+参考测试覆盖不同安放角、叶片中线与两侧及根部内环。
+
+主流程回归注入了 20 个叶片探针不匹配及分类/采样异常，确认不抛出异常、
+全部失败点写入 JSON，并在三个文件流程替身输出后正常返回。
+测试替身不是真实 STEP；云端仍无法启动 Windows SpaceClaim，实际 CAD 输出须本机确认。

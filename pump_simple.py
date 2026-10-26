@@ -19,7 +19,7 @@ PARAMS = {
     "front_shroud_thickness": 3.0, # 前盖板厚度，仅定位金属边界 Z=-t..0，不生成金属
     "rear_shroud_thickness": 4.0,  # 后盖板厚度，仅定位金属边界 Z=h..h+t，不生成金属
     "blade_tool_overrun": 2.0,     # 叶片刀具超出圆盘外缘和上下边界的长度
-    "section_angle_deg": 0.0,      # 含 Z 轴的剖切平面方位角
+    "section_angle_deg": 18.0,     # 默认避开 5 个径向叶片槽的轴截面角；0° 会沿 +X 叶片槽切开
     "section_grid_count": 181,    # CAD 剖面填色采样网格边长（整数，非几何尺寸）
     "mesh_weld_tolerance": 1e-5,   # 三角化表面合并重合顶点的绝对距离
     "alignment_tolerance": 0.01,   # 拟合轴心/半径和接口位置的绝对容差，mm
@@ -367,26 +367,79 @@ def check_alignment(meshes, p):
             "note": "impeller eye is an interface envelope, not a separate cylindrical wall; blade-root end faces remain walls"}
 
 
+def check_impeller_footprint(mesh, p):
+    """中高平面按完整圆盘减轴/矩形槽的解析定义检查，不强求奇数叶片轴截面镜像对称。"""
+    import numpy as np
+    r, rs, a = p["impeller_diameter"]/2, p["shaft_diameter"]/2, p["blade_thickness"]/2
+    u = np.linspace(-r, r, p["section_grid_count"])
+    xx, yy = np.meshgrid(u, u)
+    x, y = xx.ravel(), yy.ravel()
+    radius = np.hypot(x, y)
+    expected = (radius < r) & (radius > rs)
+    margin = np.minimum(np.abs(radius-r), np.abs(radius-rs))
+    for theta, q, b, length in blade_layout(p):
+        along, across = x*cos(theta)+y*sin(theta), -x*sin(theta)+y*cos(theta)-b
+        slot = (along >= q) & (along <= q+length) & (np.abs(across) <= a)
+        expected &= ~slot
+        outside = np.hypot(np.maximum(np.maximum(q-along, along-q-length), 0),
+                           np.maximum(np.abs(across)-a, 0))
+        inside = np.minimum(np.minimum(along-q, q+length-along), a-np.abs(across))
+        margin = np.minimum(margin, np.where(slot, inside, outside))
+    points = np.c_[x, y, np.full(x.size, p["blade_height"]/2)]
+    # 同时避开解析边界和三角化边界，区别面片近似误差与大块流体缺失。
+    _, closest = mesh.find_closest_cell(points, return_closest_point=True)
+    safe = (margin > p["probe_clearance"]) & (np.linalg.norm(points-closest, axis=1) > p["probe_clearance"])
+    if not safe.any():
+        raise RuntimeError("叶轮平面网格不足以检查圆盘包络和叶片槽")
+    require_probes(mesh, points[safe], expected[safe], "叶轮完整圆盘/轴孔/阵列槽平面检查")
+    return {"passed": True, "probe_count": int(safe.sum()), "blade_count": p["blade_count"],
+            "definition": "full circular disk minus shaft and equally spaced straight blade slots"}
+
+
 def save_alignment_section(meshes, p, output):
-    """将两域实际 CAD 的轴中心截线绘在同一坐标系，核对贴合和贯通轴孔。"""
+    """实际填色+截线，轴截面旁显示完整中高截面，明确槽引起的非对称。"""
+    import numpy as np
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
     theta = radians(p["section_angle_deg"])
-    fig, ax = plt.subplots(figsize=(7, 8), constrained_layout=True)
+    r, h, n = p["impeller_diameter"]/2, p["blade_height"], p["section_grid_count"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 8), constrained_layout=True)
+    ax = axes[0]
     for name, color in (("inlet", "tab:blue"), ("impeller", "tab:orange")):
+        lo, hi = (-p["inlet_length"], 0) if name == "inlet" else (0, h)
+        uu, zz = np.meshgrid(np.linspace(-r, r, n), np.linspace(lo, hi, n))
+        pts = np.c_[uu.ravel()*cos(theta), uu.ravel()*sin(theta), zz.ravel()]
+        fluid = mesh_inside(meshes[name], pts).reshape(uu.shape)
+        ax.pcolormesh(uu, zz, np.ma.masked_where(~fluid, fluid.astype(float)),
+                      cmap=ListedColormap([color]), shading="nearest", vmin=0, vmax=1)
         section = meshes[name].slice(normal=[-sin(theta), cos(theta), 0], origin=[0, 0, 0])
         if not section.n_cells:
             raise RuntimeError(name+" 组合剖面的轴中心截线为空")
+        section.save(output/(name+"_assembly_axial_section.vtp"))
         lines, cursor = section.lines, 0
         while cursor < len(lines):
             k = lines[cursor]; ids = lines[cursor+1:cursor+1+k]; xyz = section.points[ids]
-            ax.plot(xyz[:, 0]*cos(theta)+xyz[:, 1]*sin(theta), xyz[:, 2], color=color)
+            ax.plot(xyz[:, 0]*cos(theta)+xyz[:, 1]*sin(theta), xyz[:, 2], color="black", linewidth=0.6)
             cursor += k+1
         ax.plot([], [], color=color, label=name)
-    ax.axhline(0, color="gray", linestyle="--", label="shared interface Z=0")
-    ax.set(xlabel="radial coordinate (mm)", ylabel="Z (mm)", title="CAD axial section: annular inlet + impeller")
+    ax.axhline(0, color="gray", linestyle="--", label="interface Z=0")
+    ax.set(xlim=(-r, r), xlabel="signed radial coordinate (mm)", ylabel="Z (mm)",
+           title="Actual axial section at %.1f degrees" % p["section_angle_deg"])
     ax.set_aspect("equal"); ax.legend()
+    ax = axes[1]
+    xx, yy = np.meshgrid(np.linspace(-r, r, n), np.linspace(-r, r, n))
+    pts = np.c_[xx.ravel(), yy.ravel(), np.full(xx.size, h/2)]
+    fluid = mesh_inside(meshes["impeller"], pts).reshape(xx.shape)
+    ax.pcolormesh(xx, yy, fluid, cmap="Blues", vmin=0, vmax=1, shading="nearest")
+    t = np.linspace(0, 2*pi, n)
+    ax.plot(r*np.cos(t), r*np.sin(t), "k--", linewidth=0.8, label="disk envelope")
+    ax.plot([-r*cos(theta), r*cos(theta)], [-r*sin(theta), r*sin(theta)],
+            color="red", linestyle="--", label="axial cut direction")
+    ax.set(xlabel="X (mm)", ylabel="Y (mm)", title="Actual mid-height fluid / blade and shaft voids")
+    ax.set_aspect("equal"); ax.legend()
+    fig.suptitle("CFD assembly: actual sections, no mirroring or filling of blade voids")
     fig.savefig(output/"pump_alignment_section.png", dpi=180)
     plt.close(fig)
 
@@ -394,6 +447,12 @@ def save_alignment_section(meshes, p, output):
 def export_parts(modeler, design, p, output):
     """从同一个联合模型快照分离导出；不重新建模，不跨设计复制，不依赖新版抑制 API。"""
     from ansys.geometry.core.designer.design import DesignFileFormat
+    assembly = output/"pump_assembly.step"
+    assembly.unlink(missing_ok=True)
+    design.download(str(assembly), format=DesignFileFormat.STEP)
+    if not assembly.is_file() or not assembly.stat().st_size:
+        raise RuntimeError("装配 STEP 导出失败")
+    print("已导出双流体域装配（不合并）："+str(assembly))
     with tempfile.TemporaryDirectory(prefix="pump_export_") as folder:
         snapshot = Path(folder)/"stage1.scdocx"
         design.download(str(snapshot), format=DesignFileFormat.SCDOCX)
@@ -449,13 +508,14 @@ def main():
         design, bodies = build(modeler, p)
         design, bodies = export_parts(modeler, design, p, output)
         report, meshes = {"params": p, "status": "exported_checks_pending",
-                          "step_exports": ["inlet.step", "impeller.step"], "parts": {}}, {}
+                          "step_exports": ["pump_assembly.step", "inlet.step", "impeller.step"], "parts": {}}, {}
         try:
             for name, body in bodies.items():
                 mesh, checks = check_part(body, name, p)
                 meshes[name] = mesh
                 if name == "impeller":
                     checks["channels"] = check_channels(mesh, p)
+                    checks["footprint"] = check_impeller_footprint(mesh, p)
                 checks["sections"] = save_sections(mesh, p, output, name)
                 report["parts"][name] = checks
                 print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")
@@ -465,7 +525,7 @@ def main():
         except Exception as error:
             report["status"] = "exported_checks_failed"
             report["error"] = str(error)
-            print("两个 STEP 已导出并保留；后续检查失败，详情见 pump_simple_checks.json。")
+            print("三个 STEP 已导出并保留；后续检查失败，详情见 pump_simple_checks.json。")
             raise
         finally:
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

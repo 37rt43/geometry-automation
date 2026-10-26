@@ -124,7 +124,7 @@ def blade_sketch(p, index):
 
 
 def build(modeler, p):
-    """一次建出同一设计中的两个同轴域，保持独立实体供静止/旋转域分别导出。"""
+    """先生成唯一整体流体，再沿同一 Z=0 平面精确分区。"""
     from ansys.geometry.core.math import Plane, Point2D, Point3D
     from ansys.geometry.core.misc import UNITS
     from ansys.geometry.core.sketch import Sketch
@@ -136,28 +136,67 @@ def build(modeler, p):
         sk.circle(Point2D([0, 0], unit=UNITS.mm), diameter/2*UNITS.mm)
         return design.extrude_sketch(label, sk, distance=length*UNITS.mm)
 
-    # 统一的 XY 原点、Z 轴、接口 Z=0；进口外径/轴孔直接复用叶轮参数。
     extra = p["blade_tool_overrun"]
-    inlet = cylinder("InletFluid", -p["inlet_length"], p["eye_diameter"], p["inlet_length"])
-    inlet.subtract(cylinder("InletShaftTool", -p["inlet_length"]-extra,
-                            p["shaft_diameter"], p["inlet_length"]+2*extra))
-
-    # 先建立金属刀具。前盖板有真实 eye 圆孔，叶片只占两盖板之间的高度。
+    length = p["inlet_length"]
     tf, h, tb = p["front_shroud_thickness"], p["blade_height"], p["rear_shroud_thickness"]
-    front = cylinder("FrontShroudTool", 0, p["impeller_diameter"], tf)
-    front.subtract(cylinder("EyeOpeningTool", -extra, p["eye_diameter"], tf+2*extra))
-    rear = cylinder("RearShroudTool", tf+h, p["impeller_diameter"], tb)
-    blades = [design.extrude_sketch("BladeTool_%02d" % (i+1), blade_sketch(p, i),
-                                   distance=h*UNITS.mm) for i in range(p["blade_count"])]
-    shaft = cylinder("ShaftTool", -extra, p["shaft_diameter"], tf+h+tb+2*extra)
-    # 旋转区域覆盖前盖板、叶片、后盖板；减去所有固体，仅留下相连的流体。
-    fluid = cylinder("ImpellerFluid", 0, p["impeller_diameter"], tf+h+tb)
-    for tool in [front, rear, *blades, shaft]:
+    # 一个毛坯覆盖进口和完整旋转区域，没有进口/叶轮的拼接或并集。
+    fluid = cylinder("WholeFluid", -length, p["impeller_diameter"], length+tf+h+tb)
+    # 将进口外侧非流体区与前盖板外环作为同一个连续套筒刀具，
+    # 形成从 Z=-length 到 Z=tf 的同一解析 eye 圆柱侧壁，Z=0 不预留拼接面。
+    sleeve = cylinder("InletExteriorAndFrontShroudTool", -length,
+                      p["impeller_diameter"], length+tf)
+    sleeve.subtract(cylinder("EyeOpeningTool", -length-extra,
+                             p["eye_diameter"], length+tf+2*extra))
+    fluid.subtract(sleeve)
+    fluid.subtract(cylinder("RearShroudTool", tf+h, p["impeller_diameter"], tb))
+    for i in range(p["blade_count"]):
+        tool = design.extrude_sketch("BladeTool_%02d" % (i+1), blade_sketch(p, i),
+                                    distance=h*UNITS.mm)
         fluid.subtract(tool)
+    fluid.subtract(cylinder("ShaftTool", -length-extra, p["shaft_diameter"], length+tf+h+tb+2*extra))
+    whole_bodies = design.get_all_bodies()
+    if len(whole_bodies) != 1 or whole_bodies[0].is_surface:
+        raise RuntimeError("分区前必须仅有一个整体流体实体，无残余刀具")
+    targets = expected_volumes(p)
+    whole_volume = fluid.volume.to("mm^3").magnitude
+    expected = targets["inlet"]+targets["impeller"]
+    allowed = max(p["volume_absolute_tolerance"], expected*p["volume_relative_tolerance"])
+    if not isfinite(whole_volume) or abs(whole_volume-expected) > allowed:
+        raise RuntimeError(f"整体流体体积异常：{whole_volume}，预期 {expected} mm³")
+    inlet, impeller = partition_at_interface(design, fluid, p)
+    total = sum(body.volume.to("mm^3").magnitude for body in (inlet, impeller))
+    if abs(total-whole_volume) > allowed:
+        raise RuntimeError("Z=0 分区前后体积不守恒")
     bodies = design.get_all_bodies()
     if len(bodies) != 2 or {body.name for body in bodies} != {"InletFluid", "ImpellerFluid"}:
-        raise RuntimeError("联合建模后应只有进口、叶轮两个命名流体实体，无残余刀具")
-    return design, {"inlet": inlet, "impeller": fluid}
+        raise RuntimeError("平面分区后应只有进口和叶轮两个命名实体")
+    print(f"整体流体 {whole_volume:.6f} mm³；Z=0 分区后体积守恒。")
+    return design, {"inlet": inlet, "impeller": impeller}
+
+
+def partition_at_interface(design, whole, p):
+    """24.1 用布尔半空间求交实现精确 Z=0 分区，不调用要求 25R2 的 split_body。
+
+    裁剪盒其他五个面均在整体流体外；只有共用 Z=0 平面切到流体。
+    此方法得到几何重合的两张接口面，不承诺自动共享拓扑或共形网格。
+    """
+    from ansys.geometry.core.math import Plane, Point2D, Point3D
+    from ansys.geometry.core.misc import UNITS
+    from ansys.geometry.core.sketch import Sketch
+    margin = p["blade_tool_overrun"]
+    width = p["impeller_diameter"]+2*margin
+    def halfspace(label, z, height):
+        sk = Sketch(Plane(origin=Point3D([0, 0, z], unit=UNITS.mm)))
+        sk.box(Point2D([0, 0], unit=UNITS.mm), width*UNITS.mm, width*UNITS.mm)
+        return design.extrude_sketch(label, sk, distance=height*UNITS.mm)
+    # 在任何裁剪前复制唯一的整体流体；不各自重建入口/叶轮。
+    impeller = whole.copy(design, "ImpellerFluid")
+    whole.name = "InletFluid"
+    whole.intersect(halfspace("BelowInterfaceTool", -p["inlet_length"]-margin,
+                              p["inlet_length"]+margin))
+    impeller.intersect(halfspace("AboveInterfaceTool", 0,
+                                 p["front_shroud_thickness"]+p["blade_height"]+p["rear_shroud_thickness"]+margin))
+    return whole, impeller
 
 
 def mesh_inside(mesh, points):
@@ -433,6 +472,32 @@ def check_alignment(meshes, p):
             "note": "full annular interface at Z=0; actual front-shroud eye wall fitted over 0..tf"}
 
 
+def check_interface_caps(meshes, p):
+    """核对 Z=0 两个实际三角化环形端面的面积和内外半径。"""
+    import numpy as np
+    caps = {}
+    for name, mesh in meshes.items():
+        xyz = mesh.points[mesh.faces.reshape(-1, 4)[:, 1:]]
+        chosen = np.all(np.abs(xyz[:, :, 2]) <= p["alignment_tolerance"], axis=1)
+        faces = xyz[chosen]
+        if not len(faces):
+            raise RuntimeError(name+" 缺少 Z=0 接口面")
+        normals = np.cross(faces[:, 1]-faces[:, 0], faces[:, 2]-faces[:, 0])
+        area = float(np.linalg.norm(normals, axis=1).sum()/2)
+        radii = np.linalg.norm(faces[:, :, :2], axis=2)
+        caps[name] = {"area_mm2": area, "inner_radius_mm": float(radii.min()),
+                      "outer_radius_mm": float(radii.max())}
+        for actual, expected in ((radii.min(), p["shaft_diameter"]/2),
+                                 (radii.max(), p["eye_diameter"]/2)):
+            if abs(actual-expected) > p["alignment_tolerance"]:
+                raise RuntimeError(name+" 接口内外圆不匹配")
+    allowed = max(p["alignment_tolerance"]*pi*p["eye_diameter"], p["volume_absolute_tolerance"])
+    if abs(caps["inlet"]["area_mm2"]-caps["impeller"]["area_mm2"]) > allowed:
+        raise RuntimeError("两侧 Z=0 环形接口面积不一致："+json.dumps(caps))
+    return {"passed": True, "caps": caps, "area_tolerance_mm2": allowed,
+            "shared_plane": "Z=0; geometric coincidence, no automatic shared topology"}
+
+
 def check_impeller_footprint(mesh, p):
     """中高平面按完整圆盘减轴/矩形槽的解析定义检查，不强求奇数叶片轴截面镜像对称。"""
     import numpy as np
@@ -591,7 +656,9 @@ def main():
         design, bodies = build(modeler, p)
         design, bodies = export_parts(modeler, design, p, output)
         report, meshes = {"params": p, "status": "exported_checks_pending",
-                          "step_exports": ["pump_assembly.step", "inlet.step", "impeller.step"], "parts": {}}, {}
+                          "step_exports": ["pump_assembly.step", "inlet.step", "impeller.step"],
+                          "construction": "single envelope minus solids; exact Z=0 halfspace Boolean partition (24.1)",
+                          "parts": {}}, {}
         try:
             for name, body in bodies.items():
                 mesh, checks = check_part(body, name, p)
@@ -604,6 +671,7 @@ def main():
                 report["parts"][name] = checks
                 print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")
             report["interface"] = check_alignment(meshes, p)
+            report["interface"]["cap_match"] = check_interface_caps(meshes, p)
             report["alignment_plot"] = optional_plot(save_alignment_section, meshes, p, output)
             report["status"] = "exported_checks_passed"
         except Exception as error:

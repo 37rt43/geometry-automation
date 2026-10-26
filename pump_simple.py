@@ -1,4 +1,4 @@
-"""阶段一 CFD 流体域：环形进口 + 旋转包络减前后盖板、叶片及轴（长度单位 mm）。
+"""参数化离心泵 CFD：整体进口/叶轮 + 等截面环腔 + 切向出口（长度单位 mm）。
 
 python pump_simple.py --check-only
 python pump_simple.py --output-dir output
@@ -28,10 +28,13 @@ PARAMS = {
     "probe_clearance": 0.3,        # 验证探针距解析边界的最小距离，避开三角化边界误差
     "volume_relative_tolerance": 1e-5, # CAD/解析体积相对容差（无量纲）
     "volume_absolute_tolerance": 0.01, # CAD/解析体积绝对容差，mm³
-    "volute_base_diameter": 132.0, # 后续预留：蜗壳基圆直径，本阶段不建模
-    "volute_height": 24.0,         # 后续预留：蜗壳轴向高度
-    "outlet_pipe_diameter": 40.0,  # 后续预留：出口管流体直径
-    "outlet_pipe_length": 100.0,   # 后续预留：出口管长度
+    "volute_base_diameter": 132.0, # 等截面主环腔内径；与叶轮间的间隙也保留流体
+    "volute_height": 24.0,         # 主环腔轴向高度，中心与叶片通道中面重合
+    "volute_radial_width": 32.0,   # 主环腔径向宽度，外半径=基圆半径+此值
+    "volute_connection_overlap": 1.0, # 间隙桥接及出口管布尔连接的正体积重叠量
+    "outlet_connector_length": 20.0, # 环腔外半径以外至管起点的切向延伸量
+    "outlet_pipe_diameter": 40.0,  # 切向出口管流体直径，精确圆柱
+    "outlet_pipe_length": 100.0,   # 切向出口管长度，沿 +Y
     "seal_chamber_diameter": 40.0, # 后续预留：密封腔腔径，轴径使用 shaft_diameter
     "seal_chamber_length": 20.0,   # 后续预留：密封腔长度
     "wear_ring_radial_clearance": 0.25, # 后续预留：口环单边径向间隙
@@ -41,12 +44,26 @@ PARAMS = {
 
 import argparse
 import json
-from math import cos, isfinite, pi, radians, sin
+from math import asin, cos, isfinite, pi, radians, sin, sqrt
 import os
 from pathlib import Path
 import tempfile
 
 from main import connect
+
+
+DOMAIN_LABELS = {"inlet": "InletFluid", "impeller": "ImpellerFluid",
+                 "volute": "VoluteFluid", "outlet": "OutletFluid"}
+
+
+def stationary_layout(p):
+    ri, rb = p["impeller_diameter"]/2, p["volute_base_diameter"]/2
+    ro = rb+p["volute_radial_width"]
+    center = rb+p["volute_radial_width"]/2
+    z = p["front_shroud_thickness"]+p["blade_height"]/2
+    return {"ri": ri, "rb": rb, "ro": ro, "x": center, "z": z,
+            "y_interface": ro+p["outlet_connector_length"],
+            "zlo": z-p["volute_height"]/2, "zhi": z+p["volute_height"]/2}
 
 
 def blade_layout(p):
@@ -81,6 +98,14 @@ def validate(p):
         raise ValueError("probe_clearance 过大，无法放置内部验证点")
     if p["seal_chamber_diameter"] <= p["shaft_diameter"]:
         raise ValueError("预留密封腔径须大于轴径")
+    g = stationary_layout(p)
+    overlap = p["volute_connection_overlap"]
+    if not g["rb"] > g["ri"] or overlap >= min(g["rb"]-g["ri"], p["volute_radial_width"], g["ri"]-p["hub_diameter"]/2):
+        raise ValueError("基圆须在叶轮外，连接重叠量须小于径向间隙和腔宽")
+    if p["volute_height"] < p["blade_height"]:
+        raise ValueError("环腔轴向范围必须覆盖叶片通道")
+    if not g["ri"]+p["probe_clearance"] < g["x"]-p["outlet_pipe_diameter"]/2 < g["ro"]:
+        raise ValueError("出口连接段须在叶轮外、且与环腔有正体积交叠；请调整腔宽/管径")
     return p
 
 
@@ -90,10 +115,29 @@ def expected_volumes(p):
     angle = p["blade_thickness"]/ro
     blade_area = angle*(ro*ro-rh*rh)/2
     return {
+        **stationary_volumes(p),
         "inlet": pi*((p["eye_diameter"]/2)**2-rs*rs)*p["inlet_length"],
         "impeller": (pi*(ro*ro-rs*rs)-p["blade_count"]*blade_area)*p["blade_height"]
             + pi*((p["eye_diameter"]/2)**2-rs*rs)*p["front_shroud_thickness"],
     }
+
+
+def stationary_volumes(p):
+    """矩形切向连接段与环腔/间隙桥的相交体积精确扣重，mm³。"""
+    g = stationary_layout(p)
+    d, h = p["outlet_pipe_diameter"], p["blade_height"]
+    x0 = g["x"]-d/2
+    def cap_area(radius):
+        if x0 >= radius:
+            return 0.0
+        return pi*radius**2/4-(x0*sqrt(radius**2-x0**2)+radius**2*asin(x0/radius))/2
+    # 连接段高度 d；允许 d 小于环腔高度，重叠高度按实际范围取 min。
+    ring = pi*(g["ro"]**2-g["rb"]**2)*p["volute_height"]
+    gap = pi*(g["rb"]**2-g["ri"]**2)*h
+    overlap_ring = (cap_area(g["ro"])-cap_area(g["rb"]))*min(d,p["volute_height"])
+    overlap_gap = cap_area(g["rb"])*min(d,h)  # x0>ri，不与内圆相交
+    return {"volute": ring+gap+d*d*g["y_interface"]-overlap_ring-overlap_gap,
+            "outlet": pi*(d/2)**2*p["outlet_pipe_length"]}
 
 
 def blade_sketch(p, index):
@@ -117,12 +161,12 @@ def blade_sketch(p, index):
 
 
 def build(modeler, p):
-    """先生成唯一整体流体，再沿同一 Z=0 平面精确分区。"""
+    """整体流体并入环腔、桥接和切向管，再作圆柱面及平面精确分区。"""
     from ansys.geometry.core.math import Plane, Point2D, Point3D
     from ansys.geometry.core.misc import UNITS
     from ansys.geometry.core.sketch import Sketch
     validate(p)
-    design = modeler.create_design("pump_simple_stage1")
+    design = modeler.create_design("pump_simple")
 
     def cylinder(label, z, diameter, length):
         sk = Sketch(Plane(origin=Point3D([0, 0, z], unit=UNITS.mm)))
@@ -142,6 +186,7 @@ def build(modeler, p):
                              p["eye_diameter"], length+tf+2*extra))
     fluid.subtract(sleeve)
     fluid.subtract(cylinder("RearShroudTool", tf+h, p["impeller_diameter"], tb))
+    add_stationary_flow(design, fluid, p)
     for i in range(p["blade_count"]):
         tool = design.extrude_sketch("BladeTool_%02d" % (i+1), blade_sketch(p, i),
                                     distance=h*UNITS.mm)
@@ -152,19 +197,73 @@ def build(modeler, p):
         raise RuntimeError("分区前必须仅有一个整体流体实体，无残余刀具")
     targets = expected_volumes(p)
     whole_volume = fluid.volume.to("mm^3").magnitude
-    expected = targets["inlet"]+targets["impeller"]
+    expected = sum(targets.values())
     allowed = max(p["volume_absolute_tolerance"], expected*p["volume_relative_tolerance"])
     if not isfinite(whole_volume) or abs(whole_volume-expected) > allowed:
         raise RuntimeError(f"整体流体体积异常：{whole_volume}，预期 {expected} mm³")
+    # 先按 R=叶轮外径和切向 Y 接口分离静止域，再对核心整体执行原 Z=0 分区。
+    stationary = partition_stationary(design, fluid, p)
     inlet, impeller = partition_at_interface(design, fluid, p)
-    total = sum(body.volume.to("mm^3").magnitude for body in (inlet, impeller))
+    domains = {"inlet": inlet, "impeller": impeller, **stationary}
+    total = sum(body.volume.to("mm^3").magnitude for body in domains.values())
     if abs(total-whole_volume) > allowed:
         raise RuntimeError("Z=0 分区前后体积不守恒")
     bodies = design.get_all_bodies()
-    if len(bodies) != 2 or {body.name for body in bodies} != {"InletFluid", "ImpellerFluid"}:
-        raise RuntimeError("平面分区后应只有进口和叶轮两个命名实体")
-    print(f"整体流体 {whole_volume:.6f} mm³；Z=0 分区后体积守恒。")
-    return design, {"inlet": inlet, "impeller": impeller}
+    if len(bodies) != 4 or {body.name for body in bodies} != set(DOMAIN_LABELS.values()):
+        raise RuntimeError("分区后应只有进口、叶轮、蜗壳、出口四个命名实体")
+    print(f"整体流体 {whole_volume:.6f} mm³；四域分区后体积守恒。")
+    return design, domains
+
+
+def add_stationary_flow(design, whole, p):
+    """正体积重叠布尔并集；间隙桥填满 ri..rb，主环腔 rb..ro。"""
+    from ansys.geometry.core.math import Plane, Point2D, Point3D
+    from ansys.geometry.core.misc import UNITS
+    from ansys.geometry.core.sketch import Sketch
+    g=stationary_layout(p); mm=UNITS.mm; ov=p["volute_connection_overlap"]
+    def annulus(name, z, inner, outer, height):
+        plane=Plane(origin=Point3D([0,0,z],unit=mm))
+        sk=Sketch(plane).circle(Point2D([0,0],unit=mm),outer*mm)
+        body=design.extrude_sketch(name,sk,distance=height*mm)
+        bore=Sketch(plane).circle(Point2D([0,0],unit=mm),inner*mm)
+        body.subtract(design.extrude_sketch(name+"Bore",bore,distance=height*mm))
+        return body
+    whole.unite(annulus("GapBridge",p["front_shroud_thickness"],g["ri"]-ov,g["rb"]+ov,p["blade_height"]))
+    whole.unite(annulus("VoluteRing",g["zlo"],g["rb"],g["ro"],p["volute_height"]))
+    def plane_y(y):
+        return Plane(origin=Point3D([g["x"],y,g["z"]],unit=mm),direction_x=[1,0,0],direction_y=[0,0,-1])
+    d=p["outlet_pipe_diameter"]
+    sk=Sketch(plane_y(0)).box(Point2D([0,0],unit=mm),d*mm,d*mm)
+    whole.unite(design.extrude_sketch("TangentialConnector",sk,distance=g["y_interface"]*mm))
+    sk=Sketch(plane_y(g["y_interface"]-ov)).circle(Point2D([0,0],unit=mm),d/2*mm)
+    whole.unite(design.extrude_sketch("OutletPipe",sk,distance=(p["outlet_pipe_length"]+ov)*mm))
+
+
+def partition_stationary(design, whole, p):
+    """同一整体精确布尔分区：旋转接口 R=ri；出口接口 Y=y_interface。"""
+    from ansys.geometry.core.math import Plane, Point2D, Point3D
+    from ansys.geometry.core.misc import UNITS
+    from ansys.geometry.core.sketch import Sketch
+    g=stationary_layout(p);mm=UNITS.mm;m=p["blade_tool_overrun"]
+    zlo=min(-p["inlet_length"],g["zlo"],g["z"]-p["outlet_pipe_diameter"]/2)-m
+    zhi=max(g["zhi"],g["z"]+p["outlet_pipe_diameter"]/2,p["front_shroud_thickness"]+p["blade_height"]+p["rear_shroud_thickness"])+m
+    def core_mask():
+        sk=Sketch(Plane(origin=Point3D([0,0,zlo],unit=mm))).circle(Point2D([0,0],unit=mm),g["ri"]*mm)
+        return design.extrude_sketch("RotorCylinderMask",sk,distance=(zhi-zlo)*mm)
+    volute=whole.copy(design,"VoluteFluid")
+    whole.intersect(core_mask())
+    volute.subtract(core_mask())
+    outlet=volute.copy(design,"OutletFluid")
+    # 裁剪盒在 X/Z 上覆盖所有流体，只有 Y 接口平面参与切割。
+    width=2*(g["x"]+p["outlet_pipe_diameter"]+g["ro"]+m)
+    def slab(name,y,length):
+        plane=Plane(origin=Point3D([0,y,(zlo+zhi)/2],unit=mm),direction_x=[1,0,0],direction_y=[0,0,-1])
+        sk=Sketch(plane).box(Point2D([0,0],unit=mm),width*mm,(zhi-zlo)*mm)
+        return design.extrude_sketch(name,sk,distance=length*mm)
+    ylo=-g["ro"]-m
+    volute.intersect(slab("BeforeOutletInterface",ylo,g["y_interface"]-ylo))
+    outlet.intersect(slab("AfterOutletInterface",g["y_interface"],p["outlet_pipe_length"]+m))
+    return {"volute":volute,"outlet":outlet}
 
 
 def partition_at_interface(design, whole, p):
@@ -345,7 +444,7 @@ def save_sections(mesh, p, output, name="impeller"):
             "png": png}
 
 
-def fit_cylinder_section(mesh, radius_range, label, p, z_range=None):
+def fit_cylinder_section(mesh, radius_range, label, p, z_range=None, radius_hint=None):
     """用竖直侧壁的原始顶点拟合圆；避开三角面弦中点和封盖面内部顶点。
 
     这里只测量已生成的几何，不修改几何；圆柱的弦面片不应被误当成精确圆边界。
@@ -360,6 +459,8 @@ def fit_cylinder_section(mesh, radius_range, label, p, z_range=None):
     radii = np.linalg.norm(xyz[:, :, :2], axis=2)
     # 要求整个三角形都处于指定半径带，排除叶片壁面。
     selected = vertical & np.all((radii > radius_range[0]) & (radii < radius_range[1]), axis=1)
+    if radius_hint is not None:
+        selected &= np.all(np.abs(radii-radius_hint) <= p["alignment_tolerance"], axis=1)
     if z_range is not None:
         selected &= np.all((xyz[:, :, 2] >= z_range[0]-p["alignment_tolerance"])
                            & (xyz[:, :, 2] <= z_range[1]+p["alignment_tolerance"]), axis=1)
@@ -620,7 +721,7 @@ def save_alignment_section(meshes, p, output):
 
 def check_outer_rim(mesh, p):
     rh, ro = p["hub_diameter"]/2, p["impeller_diameter"]/2
-    fit = fit_cylinder_section(mesh, (ro-(ro-rh)/4, ro+(ro-rh)/4), "叶轮外圆", p)
+    fit = fit_cylinder_section(mesh, (ro-(ro-rh)/4, ro+(ro-rh)/4), "叶轮外圆", p, radius_hint=ro)
     if abs(fit["radius_mm"]-ro) > p["alignment_tolerance"]:
         raise RuntimeError("叶轮外圆半径与扇区外弧不匹配")
     return {"passed": True, "outer_cylinder_fit": fit,
@@ -655,6 +756,74 @@ def save_outer_rim_section(mesh, p, output):
     return save_png_safely(fig,output/"impeller_outer_rim_detail.png")
 
 
+def check_stationary_paths(meshes,p):
+    g=stationary_layout(p);z=g["z"];c=p["probe_clearance"]
+    results=[]
+    points=[]
+    for i in range(p["blade_count"]):
+        t=radians(p["blade_installation_angle_deg"])+(2*i+1)*pi/p["blade_count"]
+        for r in (g["ri"]+2*c,(g["ri"]+g["rb"])/2,(g["rb"]+g["ro"])/2):
+            points.append([r*cos(t),r*sin(t),z])
+    results.append(require_probes(meshes["volute"],points,[True]*len(points),"叶轮外缘到环腔流体间隙"))
+    points=[[g["x"],y,z] for y in (0,g["ro"]/2,g["y_interface"]-2*c)]
+    results.append(require_probes(meshes["volute"],points,[True]*len(points),"环腔到切向出口连接段"))
+    points=[[g["x"],g["y_interface"]+s,z] for s in (2*c,p["outlet_pipe_length"]/2,p["outlet_pipe_length"]-2*c)]
+    results.append(require_probes(meshes["outlet"],points,[True]*len(points),"规则圆柱出口管通流"))
+    return {"passed":all(r["passed"] for r in results),"probes":results,
+            "rotor_interface_radius_mm":g["ri"],"outlet_interface_y_mm":g["y_interface"]}
+
+
+def check_stationary_geometry(meshes,p):
+    import numpy as np
+    g=stationary_layout(p);tol=p["alignment_tolerance"]
+    ring_fits={}
+    for key,radius in (("base",g["rb"]),("outer",g["ro"])):
+        fit=fit_cylinder_section(meshes["volute"],(radius-tol*2,radius+tol*2),"蜗壳"+key,p,radius_hint=radius)
+        if abs(fit["radius_mm"]-radius)>tol or np.linalg.norm(fit["center_mm"])>tol:
+            raise RuntimeError("蜗壳环腔不符合同轴等截面定义")
+        ring_fits[key]=fit
+    pipe=meshes["outlet"].copy(deep=True)
+    xyz=pipe.points.copy()
+    pipe.points=np.c_[xyz[:,0]-g["x"],xyz[:,2]-g["z"],xyz[:,1]-g["y_interface"]]
+    radius=p["outlet_pipe_diameter"]/2
+    fit=fit_cylinder_section(pipe,(0,2*radius),"切向出口管",p)
+    if abs(fit["radius_mm"]-radius)>tol or np.linalg.norm(fit["center_mm"])>tol:
+        raise RuntimeError("出口管圆柱轴心/直径不符")
+    if abs(pipe.bounds[4])>tol or abs(pipe.bounds[5]-p["outlet_pipe_length"])>tol:
+        raise RuntimeError("出口管接口平面/长度不符")
+    return {"passed":True,"ring_cylinders":ring_fits,"pipe_cylinder":fit,
+            "rotating_interface":"R=impeller_diameter/2, Z=tf..tf+h",
+            "outlet_interface_y_mm":g["y_interface"],"layout":g}
+
+
+def save_stationary_sections(mesh,p,output,name):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    g=stationary_layout(p);n=p["section_grid_count"]
+    ycut=g["y_interface"]+p["outlet_pipe_length"]/2 if name=="outlet" else -p["probe_clearance"]
+    fig,axes=plt.subplots(1,2,figsize=(12,6),constrained_layout=True)
+    for index,ax in enumerate(axes):
+        normal,origin=([0,0,1],[0,0,g["z"]]) if index==0 else ([0,1,0],[0,ycut,0])
+        cut=mesh.slice(normal=normal,origin=origin)
+        cut.save(output/(name+("_mid_section.vtp" if index==0 else "_cross_section.vtp")))
+        bounds=mesh.bounds
+        u=np.linspace(bounds[0],bounds[1],n)
+        v=np.linspace(bounds[2],bounds[3],n) if index==0 else np.linspace(bounds[4],bounds[5],n)
+        uu,vv=np.meshgrid(u,v)
+        points=np.c_[uu.ravel(),vv.ravel(),np.full(uu.size,g["z"])] if index==0 else np.c_[uu.ravel(),np.full(uu.size,ycut),vv.ravel()]
+        fluid=mesh_inside(mesh,points).reshape(uu.shape)
+        ax.pcolormesh(uu,vv,fluid,cmap="Blues",vmin=0,vmax=1,shading="nearest")
+        lines=cut.lines;cursor=0
+        while cursor<len(lines):
+            k=lines[cursor];ids=lines[cursor+1:cursor+1+k];xyz=cut.points[ids]
+            ax.plot(xyz[:,0],xyz[:,1] if index==0 else xyz[:,2],color="black",linewidth=0.6);cursor+=k+1
+        ax.set_aspect("equal");ax.set(xlabel="X (mm)",ylabel="Y (mm)" if index==0 else "Z (mm)",
+                                     title=name+(" XY mid-plane" if index==0 else " XZ cross-section"))
+    return save_png_safely(fig,output/(name+"_sections.png"))
+
+
 def export_parts(modeler, design, p, output):
     """从同一个联合模型快照分离导出；不重新建模，不跨设计复制，不依赖新版抑制 API。"""
     from ansys.geometry.core.designer.design import DesignFileFormat
@@ -663,25 +832,25 @@ def export_parts(modeler, design, p, output):
     design.download(str(assembly), format=DesignFileFormat.STEP)
     if not assembly.is_file() or not assembly.stat().st_size:
         raise RuntimeError("装配 STEP 导出失败")
-    print("已导出双流体域装配（不合并）："+str(assembly))
+    print("已导出四流体域装配（不合并）："+str(assembly))
     with tempfile.TemporaryDirectory(prefix="pump_export_") as folder:
         snapshot = Path(folder)/"stage1.scdocx"
         design.download(str(snapshot), format=DesignFileFormat.SCDOCX)
         if not snapshot.is_file() or not snapshot.stat().st_size:
             raise RuntimeError("联合模型快照保存失败")
-        for name, label in (("inlet", "InletFluid"), ("impeller", "ImpellerFluid")):
+        for name, label in DOMAIN_LABELS.items():
             # open_file 会关闭当前设计；每次均从同一未删减的联合快照恢复。
             isolated = modeler.open_file(str(snapshot))
             bodies = isolated.get_all_bodies()
-            if len(bodies) != 2 or {b.name for b in bodies} != {"InletFluid", "ImpellerFluid"}:
-                raise RuntimeError("联合快照重载后未保留两个命名域")
+            if len(bodies) != 4 or {b.name for b in bodies} != set(DOMAIN_LABELS.values()):
+                raise RuntimeError("联合快照重载后未保留四个命名域")
             for body in bodies:
                 if body.name != label:
                     isolated.delete_body(body)
             remaining = isolated.get_all_bodies()
             if len(remaining) != 1 or remaining[0].name != label:
                 raise RuntimeError(name+" 导出隔离失败")
-            # 这里只做必要的导出隔离；所有几何/网格/探针检查均放在两个 STEP 写出后。
+            # 这里只做必要的导出隔离；所有几何/网格/探针检查均放在五个 STEP 写出后。
             destination = output/(name+".step")
             destination.unlink(missing_ok=True)
             isolated.download(str(destination), format=DesignFileFormat.STEP)
@@ -691,7 +860,7 @@ def export_parts(modeler, design, p, output):
         # open_file 关闭过原设计；恢复联合快照后才进行后续检查。
         restored = modeler.open_file(str(snapshot))
         lookup = {body.name: body for body in restored.get_all_bodies()}
-        return restored, {"inlet": lookup["InletFluid"], "impeller": lookup["ImpellerFluid"]}
+        return restored, {name:lookup[label] for name,label in DOMAIN_LABELS.items()}
 
 
 def main():
@@ -719,8 +888,8 @@ def main():
         design, bodies = build(modeler, p)
         design, bodies = export_parts(modeler, design, p, output)
         report, meshes = {"params": p, "status": "exported_checks_pending",
-                          "step_exports": ["pump_assembly.step", "inlet.step", "impeller.step"],
-                          "construction": "single envelope minus solids; exact Z=0 halfspace Boolean partition (24.1)",
+                          "step_exports": ["pump_assembly.step", *[name+".step" for name in DOMAIN_LABELS]],
+                          "construction": "connected core+gap+ring+connector+pipe; exact cylindrical/planar Boolean partitions (24.1)",
                           "parts": {}}, {}
         try:
             for name, body in bodies.items():
@@ -732,20 +901,23 @@ def main():
                     checks["shrouds"] = run_probe_check(check_shrouds, mesh, p)
                     checks["outer_rim"] = check_outer_rim(mesh, p)
                     checks["outer_rim_plot"] = optional_plot(save_outer_rim_section, mesh, p, output)
-                checks["sections"] = optional_plot(save_sections, mesh, p, output, name)
+                checks["sections"] = optional_plot(save_sections if name in ("inlet","impeller") else save_stationary_sections, mesh, p, output, name)
                 report["parts"][name] = checks
                 print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")
-            report["interface"] = check_alignment(meshes, p)
-            report["interface"]["cap_match"] = check_interface_caps(meshes, p)
-            report["alignment_plot"] = optional_plot(save_alignment_section, meshes, p, output)
+            core_meshes={name:meshes[name] for name in ("inlet","impeller")}
+            report["interface"] = check_alignment(core_meshes, p)
+            report["interface"]["cap_match"] = check_interface_caps(core_meshes, p)
+            report["stationary_geometry"] = check_stationary_geometry(meshes, p)
+            report["stationary_probes"] = run_probe_check(check_stationary_paths, meshes, p)
+            report["alignment_plot"] = optional_plot(save_alignment_section, core_meshes, p, output)
             report["probe_warnings"] = collect_probe_warnings(report)
             report["status"] = "exported_with_probe_warnings" if report["probe_warnings"] else "exported_checks_passed"
             if report["probe_warnings"]:
-                print(f"三个 STEP 导出成功；{len(report['probe_warnings'])} 项探针警告已记录，正常结束（退出码 0）。")
+                print(f"五个 STEP 导出成功；{len(report['probe_warnings'])} 项探针警告已记录，正常结束（退出码 0）。")
         except Exception as error:
             report["status"] = "exported_checks_failed"
             report["error"] = str(error)
-            print("三个 STEP 已导出并保留；后续检查失败，详情见 pump_simple_checks.json。")
+            print("五个 STEP 已导出并保留；后续检查失败，详情见 pump_simple_checks.json。")
             raise
         finally:
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

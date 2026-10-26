@@ -1,14 +1,14 @@
-"""阶段一 CFD 流体域：环形进口流体 + 圆盘减叶片和轴（长度单位 mm）。
+"""阶段一 CFD 流体域：环形进口 + 旋转包络减前后盖板、叶片及轴（长度单位 mm）。
 
 python pump_simple.py --check-only
 python pump_simple.py --output-dir output
 本机启动沿用 main.connect() / launch_modeler_with_spaceclaim，后端为 241。
-只用草图拉伸、圆周重复拉伸和布尔减法；不调用原生脚本，不构造金属零件。
+只用草图拉伸、圆周重复拉伸和布尔减法；不调用原生脚本；金属实体仅作布尔刀具，不导出。
 """
 
 PARAMS = {
     "eye_diameter": 50.0,          # 进口眼/进口管共用的唯一流体直径
-    "inlet_length": 80.0,          # 进口流体圆柱长度，Z=-length..0（含穿过前盖板的段）
+    "inlet_length": 80.0,          # 进口流体圆柱长度，Z=-length..0，止于前盖板外表面
     "impeller_diameter": 120.0,    # 两平面盖板之间的流体圆盘外径
     "hub_diameter": 30.0,          # 叶片根部定位圆直径；此阶段不扣除轮毂实体
     "shaft_diameter": 16.0,        # 进口和叶轮共用的贯通轴孔直径，轴所占空间不属于流体
@@ -16,9 +16,9 @@ PARAMS = {
     "blade_thickness": 3.0,        # 直叶片法向厚度，单一矩形截面
     "blade_height": 12.0,          # 叶片高度及两盖板之间的流体域高度
     "blade_installation_angle_deg": 0.0, # 叶片直线相对根部径向的偏角；0 为径向直叶片
-    "front_shroud_thickness": 3.0, # 前盖板厚度，仅定位金属边界 Z=-t..0，不生成金属
-    "rear_shroud_thickness": 4.0,  # 后盖板厚度，仅定位金属边界 Z=h..h+t，不生成金属
-    "blade_tool_overrun": 2.0,     # 叶片刀具超出圆盘外缘和上下边界的长度
+    "front_shroud_thickness": 3.0, # 前盖板厚度，布尔刀具 Z=0..tf，保留眼部环形流体
+    "rear_shroud_thickness": 4.0,  # 后盖板厚度，布尔刀具 Z=tf+h..tf+h+tb
+    "blade_tool_overrun": 2.0,     # 刀具径向延伸、轴/开孔超切量；叶片轴向不跨盖板
     "section_angle_deg": 18.0,     # 默认避开 5 个径向叶片槽的轴截面角；0° 会沿 +X 叶片槽切开
     "section_grid_count": 181,    # CAD 剖面填色采样网格边长（整数，非几何尺寸）
     "mesh_weld_tolerance": 1e-5,   # 三角化表面合并重合顶点的绝对距离
@@ -84,8 +84,6 @@ def validate(p):
     # 每个矩形刀具在自己的径向扇区内，扇区间留正间隙；保守限制避免刀具相交。
     if beta + asin((a+c)/rh) >= pi/p["blade_count"]:
         raise ValueError("安放角/厚度/叶片数导致叶片扇区交叠，请减小参数")
-    if p["inlet_length"] <= p["front_shroud_thickness"]:
-        raise ValueError("进口长度须大于前盖板厚度")
     if c >= min(rs, p["blade_height"]/2, (rh-a-rs)/2, (ro-re)/2):
         raise ValueError("probe_clearance 过大，无法放置内部验证点")
     if p["seal_chamber_diameter"] <= p["shaft_diameter"]:
@@ -106,7 +104,8 @@ def expected_volumes(p):
     blade_area = circle_primitive(r, b+a)-circle_primitive(r, b-a)-2*a*q
     return {
         "inlet": pi*((p["eye_diameter"]/2)**2-rs*rs)*p["inlet_length"],
-        "impeller": (pi*(r*r-rs*rs)-p["blade_count"]*blade_area)*p["blade_height"],
+        "impeller": (pi*(r*r-rs*rs)-p["blade_count"]*blade_area)*p["blade_height"]
+            + pi*((p["eye_diameter"]/2)**2-rs*rs)*p["front_shroud_thickness"],
     }
 
 
@@ -116,7 +115,7 @@ def blade_sketch(p, index):
     from ansys.geometry.core.misc import UNITS
     from ansys.geometry.core.sketch import Sketch
     theta, q, b, length = blade_layout(p)[index]
-    sk = Sketch(Plane(origin=Point3D([0, 0, -p["blade_tool_overrun"]], unit=UNITS.mm),
+    sk = Sketch(Plane(origin=Point3D([0, 0, p["front_shroud_thickness"]], unit=UNITS.mm),
                       direction_x=[cos(theta), sin(theta), 0],
                       direction_y=[-sin(theta), cos(theta), 0]))
     return sk.box(Point2D([q+length/2, b], unit=UNITS.mm),
@@ -142,14 +141,18 @@ def build(modeler, p):
     inlet.subtract(cylinder("InletShaftTool", -p["inlet_length"]-extra,
                             p["shaft_diameter"], p["inlet_length"]+2*extra))
 
-    # 以下叶轮圆盘、叶片刀具及轴孔的尺寸/位置/减法逻辑保持不变。
-    fluid = cylinder("ImpellerFluid", 0, p["impeller_diameter"], p["blade_height"])
-    for i in range(p["blade_count"]):
-        tool = design.extrude_sketch("BladeTool_%02d" % (i+1), blade_sketch(p, i),
-                                    distance=(p["blade_height"]+2*extra)*UNITS.mm)
+    # 先建立金属刀具。前盖板有真实 eye 圆孔，叶片只占两盖板之间的高度。
+    tf, h, tb = p["front_shroud_thickness"], p["blade_height"], p["rear_shroud_thickness"]
+    front = cylinder("FrontShroudTool", 0, p["impeller_diameter"], tf)
+    front.subtract(cylinder("EyeOpeningTool", -extra, p["eye_diameter"], tf+2*extra))
+    rear = cylinder("RearShroudTool", tf+h, p["impeller_diameter"], tb)
+    blades = [design.extrude_sketch("BladeTool_%02d" % (i+1), blade_sketch(p, i),
+                                   distance=h*UNITS.mm) for i in range(p["blade_count"])]
+    shaft = cylinder("ShaftTool", -extra, p["shaft_diameter"], tf+h+tb+2*extra)
+    # 旋转区域覆盖前盖板、叶片、后盖板；减去所有固体，仅留下相连的流体。
+    fluid = cylinder("ImpellerFluid", 0, p["impeller_diameter"], tf+h+tb)
+    for tool in [front, rear, *blades, shaft]:
         fluid.subtract(tool)
-    shaft = cylinder("ShaftTool", -extra, p["shaft_diameter"], p["blade_height"]+2*extra)
-    fluid.subtract(shaft)
     bodies = design.get_all_bodies()
     if len(bodies) != 2 or {body.name for body in bodies} != {"InletFluid", "ImpellerFluid"}:
         raise RuntimeError("联合建模后应只有进口、叶轮两个命名流体实体，无残余刀具")
@@ -193,7 +196,8 @@ def check_channels(mesh, p):
     import numpy as np
     rh, rs, r = p["hub_diameter"]/2, p["shaft_diameter"]/2, p["impeller_diameter"]/2
     h, a, c = p["blade_height"], p["blade_thickness"]/2, p["probe_clearance"]
-    points, expected = [[0, 0, h/2]], [False]
+    zmid = p["front_shroud_thickness"]+h/2
+    points, expected = [[0, 0, zmid]], [False]
     for theta, q, b, length in blade_layout(p):
         # 叶片中线内部多个径向点（非流体），并检查厚度两侧的流体。
         tip = sqrt(r*r-b*b)
@@ -203,17 +207,17 @@ def check_channels(mesh, p):
                 v = b+offset
                 x, y = s*cos(theta)-v*sin(theta), s*sin(theta)+v*cos(theta)
                 if x*x+y*y < (r-c)**2:
-                    points.append([x, y, h/2]); expected.append(fluid)
+                    points.append([x, y, zmid]); expected.append(fluid)
     # 轴孔外、叶片根部内的完整流体环，把所有叶片间通道连接到进口眼。
     inner = (rs+rh-a)/2
     for i in range(p["blade_count"]*4):
         angle = 2*pi*i/(p["blade_count"]*4)
-        points.append([inner*cos(angle), inner*sin(angle), h/2]); expected.append(True)
+        points.append([inner*cos(angle), inner*sin(angle), zmid]); expected.append(True)
     # 每个扇区边界上，直接验证进口眼至外缘的径向流体路径。
     for i in range(p["blade_count"]):
         angle = (2*i+1)*pi/p["blade_count"]
         for radius in (inner, p["eye_diameter"]/2, r-2*c):
-            points.append([radius*cos(angle), radius*sin(angle), h/2]); expected.append(True)
+            points.append([radius*cos(angle), radius*sin(angle), zmid]); expected.append(True)
     actual = mesh_inside(mesh, points)
     if not np.array_equal(actual, expected):
         raise RuntimeError("CAD 叶片空区/轴孔/内环通道探针检查失败")
@@ -230,10 +234,11 @@ def save_sections(mesh, p, output, name="impeller"):
     import matplotlib.pyplot as plt
     angle = radians(p["section_angle_deg"])
     r = p["impeller_diameter"]/2 if name == "impeller" else p["eye_diameter"]/2
-    zlo, zhi = (0, p["blade_height"]) if name == "impeller" else (-p["inlet_length"], 0)
+    zlo, zhi = (0, p["front_shroud_thickness"]+p["blade_height"]) if name == "impeller" else (-p["inlet_length"], 0)
     n = p["section_grid_count"]
     axial = mesh.slice(normal=[-sin(angle), cos(angle), 0], origin=[0, 0, 0])
-    mid = mesh.slice(normal=[0, 0, 1], origin=[0, 0, (zlo+zhi)/2])
+    mid_z = p["front_shroud_thickness"]+p["blade_height"]/2 if name == "impeller" else (zlo+zhi)/2
+    mid = mesh.slice(normal=[0, 0, 1], origin=[0, 0, mid_z])
     if not axial.n_cells or not mid.n_cells:
         raise RuntimeError("轴中心/中高截面为空")
     axial.save(output/(name+"_axial_section.vtp"))
@@ -246,7 +251,7 @@ def save_sections(mesh, p, output, name="impeller"):
         if vertical:
             pts = np.c_[uu.ravel()*cos(angle), uu.ravel()*sin(angle), vv.ravel()]
         else:
-            pts = np.c_[uu.ravel(), vv.ravel(), np.full(uu.size, (zlo+zhi)/2)]
+            pts = np.c_[uu.ravel(), vv.ravel(), np.full(uu.size, mid_z)]
         selected = mesh_inside(mesh, pts).reshape(uu.shape)
         ax.pcolormesh(uu, vv, selected, cmap="Blues", vmin=0, vmax=1, shading="nearest")
         # 实际 CAD slice 线段覆盖在分类填色上。
@@ -266,7 +271,7 @@ def save_sections(mesh, p, output, name="impeller"):
     return {"source": "CAD tessellation / PyVista slice", "axial_cells": axial.n_cells, "mid_cells": mid.n_cells}
 
 
-def fit_cylinder_section(mesh, radius_range, label, p):
+def fit_cylinder_section(mesh, radius_range, label, p, z_range=None):
     """用竖直侧壁的原始顶点拟合圆；避开三角面弦中点和封盖面内部顶点。
 
     这里只测量已生成的几何，不修改几何；圆柱的弦面片不应被误当成精确圆边界。
@@ -281,6 +286,9 @@ def fit_cylinder_section(mesh, radius_range, label, p):
     radii = np.linalg.norm(xyz[:, :, :2], axis=2)
     # 要求整个三角形都处于指定半径带，排除叶片壁面。
     selected = vertical & np.all((radii > radius_range[0]) & (radii < radius_range[1]), axis=1)
+    if z_range is not None:
+        selected &= np.all((xyz[:, :, 2] >= z_range[0]-p["alignment_tolerance"])
+                           & (xyz[:, :, 2] <= z_range[1]+p["alignment_tolerance"]), axis=1)
     xy = np.unique(xyz[selected, :, :2].reshape(-1, 2), axis=0)
     if len(xy) < 3:
         raise RuntimeError(label+" 未找到足够圆柱侧壁顶点（可能缺孔、半径错误或明显偏轴）")
@@ -315,21 +323,23 @@ def check_alignment(meshes, p):
     """圆柱拟合检查轴心/半径；深内部探针验证环形流体和跨接口通路。"""
     import numpy as np
     rs, re = p["shaft_diameter"]/2, p["eye_diameter"]/2
-    length, height, tol = p["inlet_length"], p["blade_height"], p["alignment_tolerance"]
+    length, height, tol = p["inlet_length"], p["front_shroud_thickness"]+p["blade_height"], p["alignment_tolerance"]
     rh, a = p["hub_diameter"]/2, p["blade_thickness"]/2
     for name, mesh in meshes.items():
         expected_z = (-length, 0) if name == "inlet" else (0, height)
         if any(abs(x-y) > tol for x, y in zip(mesh.bounds[4:6], expected_z)):
             raise RuntimeError(f"{name} CAD 轴向包围盒 {list(mesh.bounds[4:6])} 与接口 {expected_z} 不符")
-    # shaft 与叶片根部之间的半径带只有圆柱轴孔壁；eye 是同一参数指定的接口包络。
+    # 轴孔壁位于根部内侧；eye 壁在前盖板厚度范围内，可独立拟合校验。
     inner = (rs+rh-a)/2
     fits = {
         "inlet_shaft": fit_cylinder_section(meshes["inlet"], (0, inner), "进口轴孔", p),
         "impeller_shaft": fit_cylinder_section(meshes["impeller"], (0, inner), "叶轮轴孔", p),
         "inlet_eye": fit_cylinder_section(meshes["inlet"], (inner, re+(re-rs)/2), "进口外圆", p),
+        "impeller_eye": fit_cylinder_section(meshes["impeller"], (inner, re+(re-rs)/2),
+                                              "前盖板进口眼", p, (0, p["front_shroud_thickness"])),
     }
     for name, fit in fits.items():
-        expected_radius = re if name == "inlet_eye" else rs
+        expected_radius = re if name.endswith("_eye") else rs
         if np.linalg.norm(fit["center_mm"]) > tol or abs(fit["radius_mm"]-expected_radius) > tol:
             raise RuntimeError(f"{name} 轴心/半径不符：{fit}，预期轴心 [0,0]、半径 {expected_radius} mm，容差 {tol} mm")
     left, right = fits["inlet_shaft"], fits["impeller_shaft"]
@@ -354,7 +364,7 @@ def check_alignment(meshes, p):
         angle = (2*i+1)*pi/p["blade_count"]
         for radius in (inner, (inner+re)/2, (inner+3*re)/4):
             xy.append([radius*cos(angle), radius*sin(angle)])
-    dz = min(height/4, length/4)  # 离开接口三角面，不在 Z=±0.3 的近边界层采样
+    dz = min(p["front_shroud_thickness"]/2, length/4)  # 离开接口三角面，不在 Z=±0.3 的近边界层采样
     for name, z in (("inlet", -dz), ("impeller", dz)):
         probes = [[x, y, z] for x, y in xy]
         require_probes(meshes[name], probes, [True]*len(probes), name+" 接口通流检查")
@@ -364,7 +374,7 @@ def check_alignment(meshes, p):
             "interface_z_mm": 0, "axial_gap_mm": float(meshes["impeller"].bounds[4]-meshes["inlet"].bounds[5]),
             "diameter_parameters": ["eye_diameter", "shaft_diameter"],
             "method": "cylindrical sidewall fits and deep-interior probes; shared XY, Z-axis and eye parameter",
-            "note": "impeller eye is an interface envelope, not a separate cylindrical wall; blade-root end faces remain walls"}
+            "note": "full annular interface at Z=0; actual front-shroud eye wall fitted over 0..tf"}
 
 
 def check_impeller_footprint(mesh, p):
@@ -385,7 +395,7 @@ def check_impeller_footprint(mesh, p):
                            np.maximum(np.abs(across)-a, 0))
         inside = np.minimum(np.minimum(along-q, q+length-along), a-np.abs(across))
         margin = np.minimum(margin, np.where(slot, inside, outside))
-    points = np.c_[x, y, np.full(x.size, p["blade_height"]/2)]
+    points = np.c_[x, y, np.full(x.size, p["front_shroud_thickness"]+p["blade_height"]/2)]
     # 同时避开解析边界和三角化边界，区别面片近似误差与大块流体缺失。
     _, closest = mesh.find_closest_cell(points, return_closest_point=True)
     safe = (margin > p["probe_clearance"]) & (np.linalg.norm(points-closest, axis=1) > p["probe_clearance"])
@@ -394,6 +404,23 @@ def check_impeller_footprint(mesh, p):
     require_probes(mesh, points[safe], expected[safe], "叶轮完整圆盘/轴孔/阵列槽平面检查")
     return {"passed": True, "probe_count": int(safe.sum()), "blade_count": p["blade_count"],
             "definition": "full circular disk minus shaft and equally spaced straight blade slots"}
+
+
+def check_shrouds(mesh, p):
+    """前盖板眼内通流、眼外封闭、后盖板封闭；眼部不应被叶片超切。"""
+    from math import cos, sin, pi
+    tf, h, tb = p["front_shroud_thickness"], p["blade_height"], p["rear_shroud_thickness"]
+    rs, re, r = p["shaft_diameter"]/2, p["eye_diameter"]/2, p["impeller_diameter"]/2
+    points, expected = [], []
+    for i in range(p["blade_count"]*4):
+        angle = 2*pi*i/(p["blade_count"]*4)
+        for radius, fluid in ((rs/2, False), ((rs+re)/2, True), ((re+r)/2, False)):
+            points.append([radius*cos(angle), radius*sin(angle), tf/2]); expected.append(fluid)
+        # 后盖板原体积中没有流体。
+        points.append([(rs+r)/2*cos(angle), (rs+r)/2*sin(angle), tf+h+tb/2]); expected.append(False)
+    require_probes(mesh, points, expected, "前后盖板/进口眼壁面检查")
+    return {"passed": True, "probe_count": len(points), "front_eye_z_mm": [0, tf],
+            "blade_channel_z_mm": [tf, tf+h], "rear_shroud_z_mm": [tf+h, tf+h+tb]}
 
 
 def save_alignment_section(meshes, p, output):
@@ -408,7 +435,7 @@ def save_alignment_section(meshes, p, output):
     fig, axes = plt.subplots(1, 2, figsize=(12, 8), constrained_layout=True)
     ax = axes[0]
     for name, color in (("inlet", "tab:blue"), ("impeller", "tab:orange")):
-        lo, hi = (-p["inlet_length"], 0) if name == "inlet" else (0, h)
+        lo, hi = (-p["inlet_length"], 0) if name == "inlet" else (0, p["front_shroud_thickness"]+h)
         uu, zz = np.meshgrid(np.linspace(-r, r, n), np.linspace(lo, hi, n))
         pts = np.c_[uu.ravel()*cos(theta), uu.ravel()*sin(theta), zz.ravel()]
         fluid = mesh_inside(meshes[name], pts).reshape(uu.shape)
@@ -425,12 +452,13 @@ def save_alignment_section(meshes, p, output):
             cursor += k+1
         ax.plot([], [], color=color, label=name)
     ax.axhline(0, color="gray", linestyle="--", label="interface Z=0")
+    ax.axhline(p["front_shroud_thickness"], color="gray", linestyle=":", label="front inner wall Z=tf")
     ax.set(xlim=(-r, r), xlabel="signed radial coordinate (mm)", ylabel="Z (mm)",
            title="Actual axial section at %.1f degrees" % p["section_angle_deg"])
     ax.set_aspect("equal"); ax.legend()
     ax = axes[1]
     xx, yy = np.meshgrid(np.linspace(-r, r, n), np.linspace(-r, r, n))
-    pts = np.c_[xx.ravel(), yy.ravel(), np.full(xx.size, h/2)]
+    pts = np.c_[xx.ravel(), yy.ravel(), np.full(xx.size, p["front_shroud_thickness"]+h/2)]
     fluid = mesh_inside(meshes["impeller"], pts).reshape(xx.shape)
     ax.pcolormesh(xx, yy, fluid, cmap="Blues", vmin=0, vmax=1, shading="nearest")
     t = np.linspace(0, 2*pi, n)
@@ -516,6 +544,7 @@ def main():
                 if name == "impeller":
                     checks["channels"] = check_channels(mesh, p)
                     checks["footprint"] = check_impeller_footprint(mesh, p)
+                    checks["shrouds"] = check_shrouds(mesh, p)
                 checks["sections"] = save_sections(mesh, p, output, name)
                 report["parts"][name] = checks
                 print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")

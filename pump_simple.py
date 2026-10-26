@@ -22,6 +22,9 @@ PARAMS = {
     "section_angle_deg": 0.0,      # 含 Z 轴的剖切平面方位角
     "section_grid_count": 181,    # CAD 剖面填色采样网格边长（整数，非几何尺寸）
     "mesh_weld_tolerance": 1e-5,   # 三角化表面合并重合顶点的绝对距离
+    "alignment_tolerance": 0.01,   # 拟合轴心/半径和接口位置的绝对容差，mm
+    "wall_normal_z_tolerance": 1e-6, # 提取圆柱侧壁时法向 Z 分量上限（无量纲）
+    "mesh_inside_relative_tolerance": 1e-7, # VTK 内外分类相对于包围盒对角线的容差
     "probe_clearance": 0.3,        # 验证探针距解析边界的最小距离，避开三角化边界误差
     "volume_relative_tolerance": 1e-5, # CAD/解析体积相对容差（无量纲）
     "volume_absolute_tolerance": 0.01, # CAD/解析体积绝对容差，mm³
@@ -157,7 +160,8 @@ def mesh_inside(mesh, points):
     import numpy as np
     import pyvista as pv
     # 全部转为 mm；VTK 的封闭表面检查是本机 CAD 运行时的必要检查。
-    result = pv.PolyData(np.asarray(points)).select_enclosed_points(mesh, tolerance=0.0, check_surface=True)
+    result = pv.PolyData(np.asarray(points, dtype=float)).select_enclosed_points(
+        mesh, tolerance=PARAMS["mesh_inside_relative_tolerance"], check_surface=True)
     return np.asarray(result["SelectedPoints"], dtype=bool)
 
 
@@ -262,50 +266,105 @@ def save_sections(mesh, p, output, name="impeller"):
     return {"source": "CAD tessellation / PyVista slice", "axial_cells": axial.n_cells, "mid_cells": mid.n_cells}
 
 
+def fit_cylinder_section(mesh, radius_range, label, p):
+    """用竖直侧壁的原始顶点拟合圆；避开三角面弦中点和封盖面内部顶点。
+
+    这里只测量已生成的几何，不修改几何；圆柱的弦面片不应被误当成精确圆边界。
+    """
+    import numpy as np
+    triangles = mesh.triangulate()
+    ids = triangles.faces.reshape(-1, 4)[:, 1:]
+    xyz = triangles.points[ids]
+    normals = np.cross(xyz[:, 1]-xyz[:, 0], xyz[:, 2]-xyz[:, 0])
+    norm = np.linalg.norm(normals, axis=1)
+    vertical = (norm > 0) & (np.abs(normals[:, 2]) <= p["wall_normal_z_tolerance"]*norm)
+    radii = np.linalg.norm(xyz[:, :, :2], axis=2)
+    # 要求整个三角形都处于指定半径带，排除叶片壁面。
+    selected = vertical & np.all((radii > radius_range[0]) & (radii < radius_range[1]), axis=1)
+    xy = np.unique(xyz[selected, :, :2].reshape(-1, 2), axis=0)
+    if len(xy) < 3:
+        raise RuntimeError(label+" 未找到足够圆柱侧壁顶点（可能缺孔、半径错误或明显偏轴）")
+    origin = xy.mean(axis=0)
+    local = xy-origin
+    coefficients, _, rank, _ = np.linalg.lstsq(
+        np.c_[2*local, np.ones(len(local))], np.sum(local*local, axis=1), rcond=None)
+    if rank != 3:
+        raise RuntimeError(label+" 圆柱顶点不足以确定圆")
+    center = coefficients[:2]+origin
+    radius = float(np.sqrt(coefficients[2]+np.dot(coefficients[:2], coefficients[:2])))
+    residual = float(np.max(np.abs(np.linalg.norm(xy-center, axis=1)-radius)))
+    if not np.isfinite(radius) or residual > p["alignment_tolerance"]:
+        raise RuntimeError(f"{label} 非圆柱侧壁：拟合残差 {residual:.6g} mm")
+    return {"center_mm": center.tolist(), "radius_mm": radius, "residual_mm": residual,
+            "vertex_count": len(xy)}
+
+
+def require_probes(mesh, points, expected, label):
+    import numpy as np
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    expected = np.asarray(expected, dtype=bool)
+    actual = mesh_inside(mesh, points)
+    failed = np.flatnonzero(actual != expected)
+    if failed.size:
+        details = [{"xyz_mm": points[i].tolist(), "expected_fluid": bool(expected[i]),
+                    "actual_fluid": bool(actual[i])} for i in failed[:8]]
+        raise RuntimeError(f"{label}: {failed.size}/{len(points)} 个探针失败；"+json.dumps(details))
+
+
 def check_alignment(meshes, p):
-    """两域包围盒贴合；轴孔/外圆内外探针；Z=0 两侧通流探针。"""
+    """圆柱拟合检查轴心/半径；深内部探针验证环形流体和跨接口通路。"""
     import numpy as np
     rs, re = p["shaft_diameter"]/2, p["eye_diameter"]/2
-    c, length, height = p["probe_clearance"], p["inlet_length"], p["blade_height"]
+    length, height, tol = p["inlet_length"], p["blade_height"], p["alignment_tolerance"]
+    rh, a = p["hub_diameter"]/2, p["blade_thickness"]/2
     for name, mesh in meshes.items():
         expected_z = (-length, 0) if name == "inlet" else (0, height)
-        if any(abs(a-b) > p["mesh_weld_tolerance"] for a, b in zip(mesh.bounds[4:6], expected_z)):
-            raise RuntimeError(name+" CAD 轴向包围盒与共面接口不符")
-    # 圆周多个方向、多处轴向站点，确认进口中心始终空、内外径同轴且无误挖/堵塞。
+        if any(abs(x-y) > tol for x, y in zip(mesh.bounds[4:6], expected_z)):
+            raise RuntimeError(f"{name} CAD 轴向包围盒 {list(mesh.bounds[4:6])} 与接口 {expected_z} 不符")
+    # shaft 与叶片根部之间的半径带只有圆柱轴孔壁；eye 是同一参数指定的接口包络。
+    inner = (rs+rh-a)/2
+    fits = {
+        "inlet_shaft": fit_cylinder_section(meshes["inlet"], (0, inner), "进口轴孔", p),
+        "impeller_shaft": fit_cylinder_section(meshes["impeller"], (0, inner), "叶轮轴孔", p),
+        "inlet_eye": fit_cylinder_section(meshes["inlet"], (inner, re+(re-rs)/2), "进口外圆", p),
+    }
+    for name, fit in fits.items():
+        expected_radius = re if name == "inlet_eye" else rs
+        if np.linalg.norm(fit["center_mm"]) > tol or abs(fit["radius_mm"]-expected_radius) > tol:
+            raise RuntimeError(f"{name} 轴心/半径不符：{fit}，预期轴心 [0,0]、半径 {expected_radius} mm，容差 {tol} mm")
+    left, right = fits["inlet_shaft"], fits["impeller_shaft"]
+    if (np.linalg.norm(np.array(left["center_mm"])-right["center_mm"]) > tol
+            or abs(left["radius_mm"]-right["radius_mm"]) > tol):
+        raise RuntimeError("两域轴孔拟合轴心/半径不一致："+json.dumps(fits))
+    # 不在 rs±0.3、re±0.3 处分类：粗三角化的弦面会使这些点跨越网格边界。
+    # 半径/同轴由上面的拟合验证；内外分类仅用远离边界的代表性点。
     points, expected = [], []
+    ring_middle = (rs+re)/2
     for fraction in (0.25, 0.5, 0.75):
         z = -length*fraction
-        points.append([0, 0, z]); expected.append(False)
+        points.append([0.0, 0.0, z]); expected.append(False)
         for i in range(p["blade_count"]*4):
-            angle = 2*pi*i/(p["blade_count"]*4)
-            for radius, fluid in ((rs-c, False), (rs+c, True), (re-c, True), (re+c, False)):
+            angle = 2*pi*(i+0.5)/(p["blade_count"]*4)
+            for radius, fluid in ((rs/2, False), (ring_middle, True), (re+(re-rs)/2, False)):
                 points.append([radius*cos(angle), radius*sin(angle), z]); expected.append(fluid)
-    if not np.array_equal(mesh_inside(meshes["inlet"], points), expected):
-        raise RuntimeError("进口轴孔/环形流体截面/外径探针检查失败")
-    # 检查同一 XY 点在接口两侧都位于流体内：内环及所有叶间通道。
-    rh, a = p["hub_diameter"]/2, p["blade_thickness"]/2
-    inner = (rs+rh-a)/2
+    require_probes(meshes["inlet"], points, expected, "进口环形流体/轴孔检查")
+    # 采样位置由半径与角度在全局 XY 中直接构造，两个域用完全相同的 XY。
     xy = []
     for i in range(p["blade_count"]):
         angle = (2*i+1)*pi/p["blade_count"]
-        for radius in (inner, (inner+re)/2, re-c):
+        for radius in (inner, (inner+re)/2, (inner+3*re)/4):
             xy.append([radius*cos(angle), radius*sin(angle)])
-    dz = min(c, length/4, height/4)
+    dz = min(height/4, length/4)  # 离开接口三角面，不在 Z=±0.3 的近边界层采样
     for name, z in (("inlet", -dz), ("impeller", dz)):
         probes = [[x, y, z] for x, y in xy]
-        if not mesh_inside(meshes[name], probes).all():
-            raise RuntimeError(name+" 在 Z=0 接口附近的通流探针失败")
-        # 两侧同轴贯通轴孔，避免只检查进口轴心而漏掉叶轮孔径不匹配。
-        for i in range(p["blade_count"]*4):
-            angle = 2*pi*i/(p["blade_count"]*4)
-            pair = [[radius*cos(angle), radius*sin(angle), z] for radius in (rs-c, rs+c)]
-            if not np.array_equal(mesh_inside(meshes[name], pair), [False, True]):
-                raise RuntimeError("接口两侧轴孔径/同轴探针失败")
+        require_probes(meshes[name], probes, [True]*len(probes), name+" 接口通流检查")
+        require_probes(meshes[name], [[0, 0, z]], [False], name+" 贯通轴孔检查")
     return {"passed": True, "inlet_probe_count": len(points), "throughflow_paths": len(xy),
-            "interface_z_mm": 0, "axial_gap_mm": 0, "overlap_volume_mm3": 0,
+            "cylinder_fits": fits, "alignment_tolerance_mm": tol,
+            "interface_z_mm": 0, "axial_gap_mm": float(meshes["impeller"].bounds[4]-meshes["inlet"].bounds[5]),
             "diameter_parameters": ["eye_diameter", "shaft_diameter"],
-            "method": "CAD bounds and probes on both sides; disjoint axial interiors; connected inner annulus",
-            "note": "shared annular eye minus blade-root footprints; blade-root end faces remain walls"}
+            "method": "cylindrical sidewall fits and deep-interior probes; shared XY, Z-axis and eye parameter",
+            "note": "impeller eye is an interface envelope, not a separate cylindrical wall; blade-root end faces remain walls"}
 
 
 def save_alignment_section(meshes, p, output):
@@ -352,14 +411,17 @@ def export_parts(modeler, design, p, output):
             remaining = isolated.get_all_bodies()
             if len(remaining) != 1 or remaining[0].name != label:
                 raise RuntimeError(name+" 导出隔离失败")
-            # 快照重载后再次检查实体和体积，确保导出对应同一几何。
-            check_part(remaining[0], name, p)
+            # 这里只做必要的导出隔离；所有几何/网格/探针检查均放在两个 STEP 写出后。
             destination = output/(name+".step")
             destination.unlink(missing_ok=True)
             isolated.download(str(destination), format=DesignFileFormat.STEP)
             if not destination.is_file() or not destination.stat().st_size:
                 raise RuntimeError("STEP 导出失败："+str(destination))
             print("已独立导出："+str(destination))
+        # open_file 关闭过原设计；恢复联合快照后才进行后续检查。
+        restored = modeler.open_file(str(snapshot))
+        lookup = {body.name: body for body in restored.get_all_bodies()}
+        return restored, {"inlet": lookup["InletFluid"], "impeller": lookup["ImpellerFluid"]}
 
 
 def main():
@@ -385,20 +447,29 @@ def main():
         report_path = output/"pump_simple_checks.json"
         report_path.unlink(missing_ok=True)
         design, bodies = build(modeler, p)
-        report, meshes = {"params": p, "parts": {}}, {}
-        for name, body in bodies.items():
-            mesh, checks = check_part(body, name, p)
-            meshes[name] = mesh
-            if name == "impeller":
-                checks["channels"] = check_channels(mesh, p)
-            checks["sections"] = save_sections(mesh, p, output, name)
-            report["parts"][name] = checks
-            print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")
-        report["interface"] = check_alignment(meshes, p)
-        save_alignment_section(meshes, p, output)
-        export_parts(modeler, design, p, output)
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("阶段一流体域检查及导出完成；请查看 inlet_sections.png、impeller_sections.png 和 pump_alignment_section.png。")
+        design, bodies = export_parts(modeler, design, p, output)
+        report, meshes = {"params": p, "status": "exported_checks_pending",
+                          "step_exports": ["inlet.step", "impeller.step"], "parts": {}}, {}
+        try:
+            for name, body in bodies.items():
+                mesh, checks = check_part(body, name, p)
+                meshes[name] = mesh
+                if name == "impeller":
+                    checks["channels"] = check_channels(mesh, p)
+                checks["sections"] = save_sections(mesh, p, output, name)
+                report["parts"][name] = checks
+                print(f"{name}: CFD 流体实体，体积 {checks['volume_mm3']:.6f} mm³")
+            report["interface"] = check_alignment(meshes, p)
+            save_alignment_section(meshes, p, output)
+            report["status"] = "exported_checks_passed"
+        except Exception as error:
+            report["status"] = "exported_checks_failed"
+            report["error"] = str(error)
+            print("两个 STEP 已导出并保留；后续检查失败，详情见 pump_simple_checks.json。")
+            raise
+        finally:
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("STEP 导出及检查完成；请查看 inlet_sections.png、impeller_sections.png 和 pump_alignment_section.png。")
     finally:
         modeler.close()
 

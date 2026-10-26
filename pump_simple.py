@@ -140,7 +140,7 @@ def build(modeler, p):
     length = p["inlet_length"]
     tf, h, tb = p["front_shroud_thickness"], p["blade_height"], p["rear_shroud_thickness"]
     # 一个毛坯覆盖进口和完整旋转区域，没有进口/叶轮的拼接或并集。
-    fluid = cylinder("WholeFluid", -length, p["impeller_diameter"], length+tf+h+tb)
+    fluid = cylinder("InletFluid", -length, p["impeller_diameter"], length+tf+h+tb)
     # 将进口外侧非流体区与前盖板外环作为同一个连续套筒刀具，
     # 形成从 Z=-length 到 Z=tf 的同一解析 eye 圆柱侧壁，Z=0 不预留拼接面。
     sleeve = cylinder("InletExteriorAndFrontShroudTool", -length,
@@ -190,8 +190,8 @@ def partition_at_interface(design, whole, p):
         sk.box(Point2D([0, 0], unit=UNITS.mm), width*UNITS.mm, width*UNITS.mm)
         return design.extrude_sketch(label, sk, distance=height*UNITS.mm)
     # 在任何裁剪前复制唯一的整体流体；不各自重建入口/叶轮。
+    # 24.1 只在 extrude/copy 创建请求中指定名称；绝不调用 Body.name setter。
     impeller = whole.copy(design, "ImpellerFluid")
-    whole.name = "InletFluid"
     whole.intersect(halfspace("BelowInterfaceTool", -p["inlet_length"]-margin,
                               p["inlet_length"]+margin))
     impeller.intersect(halfspace("AboveInterfaceTool", 0,

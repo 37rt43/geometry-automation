@@ -142,3 +142,29 @@ Windows 上另检查非法路径组件/保留名；目标文件被查看器占�
 验证只有一个初始整体毛坯、没有单独拉伸进口或叶轮域、所有刀具消耗、分区前后体积守恒，
 并对两个分区运行封闭连通、端面匹配、轴孔/eye、盖板和通道检查。
 测试替身不等同于 Ansys Geometry Service；原生 CAD 拓扑和真实 STEP 仍需本机验证。
+
+## 24.1 命名兼容性修正
+
+禁止写入 `body.name` 或调用 `set_name()`：它们需要 25.1。
+整体毛坯在 `extrude_sketch()` 创建时即使用名称 `InletFluid`（此时仍是完整整体，
+名称不会影响形状）；上半区在 `copy(design, "ImpellerFluid")` 创建时指定名称。
+V0 的 CopyRequest 本身带 name 字段，不额外调用 SetName。
+因此快照及导出仍能识别两个域，文件名依旧为 inlet.step / impeller.step；
+本次不改变任何尺寸、布尔或 Z=0 分区逻辑。
+
+已检查本脚本直接使用的客户端 API 及委托属性：
+
+| 接口 | 本次核查 |
+| --- | --- |
+| `extrude_sketch` / `copy` | 创建时传名称，无后续 name setter；copy 使用 V0 创建请求 |
+| `subtract` / `intersect` / `get_all_bodies` / `delete_body` | 无高于 24.1 的版本门禁，布尔运算走旧版分支 |
+| `volume` / `is_surface` / `name` 读取 / `tessellate` | 无高于 24.1 的版本门禁；不传新版三角化选项 |
+| `create_design` / `open_file` / `download` / `close` | 无高于 24.1 的版本门禁；download 对旧版走 legacy 分支 |
+
+本脚本不调用较新版的 `set_name`、`set_color`、`set_suppressed`、`bounding_box`、
+`face.shape`、`rotate`、`split_body` 等方法或属性，也不使用原生脚本中转。
+这些是源码及调用路径审查结果，并不等于对真实 24.1 后端的运行认证。
+
+回归测试将测试替身中的所有创建后 name 写入设为抛出与 24.1 相同的错误，
+实际 build/partition 及导出函数仍通过，三种文件流程分别保留正确域；
+文件流程替身不产生真实 STEP。云端真实运行仍在启动 Windows SpaceClaim 时受平台限制。

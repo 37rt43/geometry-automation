@@ -35,6 +35,10 @@ PARAMS = {
     "volute_axial_width": 32.0,    # 梯形外侧轴向高度；内侧高度共用 blade_height
     "volute_wrap_deg": 330.0,      # 主螺旋包角；从 tongue_position_deg 起计
     "volute_section_count": 57,   # 平滑放样的主蜗壳截面数，非分段棱柱
+    "volute_loft_radial_overrun": 1.0, # 放样内侧牺牲延伸，埋入间隙桥；末端平滑归零
+    "volute_boolean_axial_overrun": 3.0, # 隔舌刀具上下贯穿放样包络的余量
+    "volute_min_positive_thickness": 0.5, # 构造截面的最小正高度/保留间隙
+    "volute_boolean_volume_epsilon": 0.001, # 正体积重叠验收下限 mm³；不是未确认的 Boolean tolerance 重载
     "volute_connection_overlap": 1.0, # 均匀间隙桥与核心/蜗壳的布尔重叠量
     "tongue_position_deg": 0.0,    # 隔舌和螺旋起点的绝对方位
     "tongue_orientation_deg": 0.0, # 隔舌长轴相对起点径向的偏角
@@ -95,7 +99,7 @@ def stationary_layout(p):
             "direction":[-sin(end),cos(end),0],"diffuser_end_scale":scale}
 
 
-def volute_profiles(p):
+def volute_profiles(p, construction=False):
     """四角一致的梯形截面；中心轨迹半径 rb+w/2 单调增大形成螺旋。"""
     g=stationary_layout(p); sections=[]
     def section(theta,width,scale=1.0,advance=0.0):
@@ -117,6 +121,19 @@ def volute_profiles(p):
         advance=p["diffuser_length"]*i/(p["diffuser_section_count"]-1)
         scale=1+2*diffuser_gain(advance,p)/p["volute_end_width"]
         sections.append(section(g["end_theta"],p["volute_end_width"],scale,advance))
+    if construction:
+        # 仅将主蜗壳内侧端点沿原有梯形直边向内延长，外轮廓完全不动。
+        # 末端 C2 归零，扩散段所有截面保持原样，避免改变相切过渡。
+        for i,v in enumerate(sections[:p["volute_section_count"]]):
+            t=i/(p["volute_section_count"]-1)
+            overrun=p["volute_loft_radial_overrun"]*smooth_growth(1-t)
+            inner_height=v["inner_height"]-(v["outer_height"]-v["inner_height"])*overrun/v["width"]
+            for corner,sign in ((0,-1),(3,1)):
+                v["points"][corner][0]-=overrun*cos(v["theta"])
+                v["points"][corner][1]-=overrun*sin(v["theta"])
+                v["points"][corner][2]=v["center"][2]+sign*inner_height/2
+            v["radial_overrun"]=overrun
+            v["construction_inner_height"]=inner_height
     return sections
 
 
@@ -192,6 +209,16 @@ def validate(p):
                 raise ValueError("扩散段触及隔舌/起始平面，请缩短扩散段或减小包角/扩散角")
             if (x*x+y*y)**0.5 < g["rb"]-p["alignment_tolerance"]:
                 raise ValueError("扩散段侵入基圆，请增加入口平滑长度或减小扩散角")
+    minimum=p["volute_min_positive_thickness"]
+    if not minimum <= p["volute_loft_radial_overrun"] < g["rb"]-g["ri"]-minimum:
+        raise ValueError("放样内伸量须小于均匀间隙，不能侵入叶轮")
+    if p["volute_connection_overlap"] < minimum:
+        raise ValueError("间隙桥必须提供足够的正重叠宽度")
+    if p["volute_boolean_axial_overrun"] < minimum:
+        raise ValueError("隔舌刀具轴向贯穿余量不足")
+    for v in volute_profiles(p,construction=True)[:p["volute_section_count"]]:
+        if v["construction_inner_height"] < minimum:
+            raise ValueError("牺牲延伸使放样内侧高度不足或反转，请减小 radial_overrun 或增大起始宽度")
     return p
 
 
@@ -289,14 +316,13 @@ def build(modeler, p):
 
 
 def spiral_native_source(p):
-    sections=volute_profiles(p)
+    sections=volute_profiles(p,construction=True)
     return r'''# Python Script, API Version = V241
 from System.Collections.Generic import List, ICollection
 import math
 stage = "read_volute_tools"
 root = GetRootPart()
 core = next(b for b in root.Bodies if b.Name == "InletFluid")
-trim = next(b for b in root.Bodies if b.Name == "VoluteInnerTrim")
 tongue = next(b for b in root.Bodies if b.Name == "TongueTool")
 KernelBody = type(core.Shape)
 profiles = List[ICollection[ITrimmedCurve]]()
@@ -319,15 +345,19 @@ if not volute.IsClosed:
     volute.Fuse(caps,False,None)
 if not volute.IsClosed or volute.PieceCount != 1 or volute.Volume <= 0:
     raise Exception("Spiral/diffuser loft is not a connected closed solid")
-stage = "enforce_exact_base_cylinder"
-tools = List[KernelBody]()
-tools.Add(trim.Shape.Copy())
-volute.Subtract(tools)
-stage = "fuse_uniform_gap_and_volute"
+# The old R=Rb subtraction was a tangential normalization, not a domain partition.
+# Hidden sacrificial loft material is embedded in the exact annular feed bridge.
+stage = "verify_base_overlap_and_fuse"
 combined = core.Shape.Copy()
+core_volume = combined.Volume
+loft_volume = volute.Volume
 parts = List[KernelBody]()
 parts.Add(volute)
 combined.Fuse(parts,False,None)
+overlap_volume = core_volume + loft_volume - combined.Volume
+if (not combined.IsClosed or combined.PieceCount != 1
+        or overlap_volume <= %r * 1e-9):
+    raise Exception("Base fusion has no strict positive overlap or is non-manifold")
 stage = "round_cutwater_nose"
 tools = List[KernelBody]()
 tools.Add(tongue.Shape.Copy())
@@ -336,11 +366,10 @@ if not combined.IsClosed or combined.PieceCount != 1 or combined.Volume <= core.
     raise Exception("Tongue or loft created an open/disconnected/empty fluid")
 stage = "commit_volute"
 core.Delete()
-trim.Delete()
 tongue.Delete()
 DesignBody.Create(root,"InletFluid",combined)
-result = {"closed":"True","pieces":"1","profile_count":str(len(section_data)),"volume_m3":str(combined.Volume)}
-''' % ([(v["points"],v["theta"]) for v in sections],)
+result = {"closed":"True","pieces":"1","profile_count":str(len(section_data)),"volume_m3":str(combined.Volume),"base_overlap_mm3":str(overlap_volume*1e9)}
+''' % ([(v["points"],v["theta"]) for v in sections],p["volute_boolean_volume_epsilon"])
 
 
 def add_stationary_flow(modeler,design,whole,p):
@@ -356,8 +385,7 @@ def add_stationary_flow(modeler,design,whole,p):
     bridge=cylinder("UniformGap",g["rb"]+ov,p["front_shroud_thickness"],p["blade_height"])
     bridge.subtract(cylinder("UniformGapBore",g["ri"]-ov,p["front_shroud_thickness"],p["blade_height"]))
     whole.unite(bridge)
-    extra=p["blade_tool_overrun"];zlo=g["zlo"]-extra;height=g["zhi"]-g["zlo"]+2*extra
-    cylinder("VoluteInnerTrim",g["rb"],zlo,height)
+    extra=p["volute_boolean_axial_overrun"];zlo=g["zlo"]-extra;height=g["zhi"]-g["zlo"]+2*extra
     angle=radians(p["tongue_position_deg"]); orientation=angle+radians(p["tongue_orientation_deg"])
     radius=p["tongue_nose_radius"];length=p["tongue_tail_length"]
     center=(g["rb"]+radius)
@@ -371,6 +399,10 @@ def add_stationary_flow(modeler,design,whole,p):
     values,design=run_checked_script(modeler,spiral_native_source(p),"variable_volute")
     if values.get("closed")!="True" or values.get("pieces")!="1":
         raise RuntimeError("V241 蜗壳原生放样/隔舌检查失败")
+    overlap=float(values.get("base_overlap_mm3","nan"))
+    if not isfinite(overlap) or overlap <= p["volute_boolean_volume_epsilon"]:
+        raise RuntimeError("V241 基圆连接未验证正体积重叠")
+    print(f"基圆连接正重叠 {overlap:.6f} mm³；未执行相切的 R=Rb Subtract。")
     bodies=design.get_all_bodies()
     if len(bodies)!=1:
         raise RuntimeError("蜗壳提交后不应残留工具体")
